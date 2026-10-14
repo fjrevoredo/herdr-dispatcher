@@ -1,0 +1,75 @@
+#!/bin/bash
+# Offline only: never delegate to an installed CLI.
+set -euo pipefail
+umask 077
+refuse() { printf 'fake herdr: %s\n' "$*" >&2; exit 2; }
+
+root=${TEST_ROOT:-}
+[ -n "$root" ] && [ -d "$root" ] && [ ! -L "$root" ] || refuse 'missing test root'
+physical=$(cd "$root" && pwd -P)
+[ "$physical" = "$root" ] || refuse 'test root must be canonical'
+case "$root" in
+    /tmp/herdr-dispatcher-test.*|/private/tmp/herdr-dispatcher-test.*|/private/var/folders/*/herdr-dispatcher-test.*) ;;
+    *) refuse 'not a temporary test root' ;;
+esac
+[ -f "$root/.offline-test-root" ] && [ ! -L "$root/.offline-test-root" ] || refuse 'missing test marker'
+inside_directory() {
+    [ -d "$1" ] || refuse 'missing sandbox directory'
+    local resolved
+    resolved=$(cd "$1" && pwd -P)
+    case "$resolved" in "$root"|"$root"/*) ;; *) refuse 'directory outside test root' ;; esac
+}
+inside_file() {
+    [ -f "$1" ] && [ ! -L "$1" ] || refuse 'missing or linked sandbox file'
+    inside_directory "$(dirname "$1")"
+}
+inside_directory "$PWD"
+inside_directory "${HOME:-/}"
+inside_file "${HERDR_DISPATCHER_CONFIG:-/}"
+inside_file "${FAKE_HERDR_LOG:-/}"
+inside_file "${FAKE_HERDR_SCENARIO:-/}"
+
+argv=$(jq -cn --args '$ARGS.positional' -- "$@")
+target=''
+previous=''
+for arg in "$@"; do
+    case "$arg" in
+        --remote|--remote=*|--machine|--machine=*|--session|--session=*) refuse 'remote/session override' ;;
+        --cwd=*) inside_directory "${arg#--cwd=}" ;;
+    esac
+    case "$previous" in
+        --pane|--workspace) target=$arg ;;
+        --cwd) inside_directory "$arg" ;;
+        --env)
+            case "$arg" in
+                HERDR_DISPATCHER_CONFIG=*) inside_file "${arg#HERDR_DISPATCHER_CONFIG=}" ;;
+            esac ;;
+    esac
+    previous=$arg
+done
+if [ -z "$target" ] && [ "$#" -ge 3 ]; then
+    case "$1 $2" in 'agent get'|'agent read'|'agent prompt'|'agent start'|'pane close'|'tab close') target=$3 ;; esac
+fi
+jq -cn --argjson argv "$argv" --arg target "$target" --arg cwd "$PWD" \
+    '{cli:"fake-herdr",argv:$argv,target:$target,cwd:$cwd}' >> "$FAKE_HERDR_LOG"
+
+entry=$(jq -ce 'if type == "array" and length > 0 then .[0] else error("empty scenario") end' "$FAKE_HERDR_SCENARIO") \
+    || refuse 'no scripted response'
+printf '%s\n' "$entry" | jq -e --argjson argv "$argv" \
+    '.argv == $argv and (.status | type == "number" and floor == . and . >= 0 and . <= 255) and has("stdout") and has("stderr")' >/dev/null \
+    || refuse 'unexpected command or invalid scenario'
+# No lock is implied: use separate scenarios for concurrent callers.
+tmp=$(mktemp "$root/scenario.XXXXXX")
+jq '.[1:]' "$FAKE_HERDR_SCENARIO" > "$tmp"
+mv "$tmp" "$FAKE_HERDR_SCENARIO"
+delay=$(printf '%s\n' "$entry" | jq -r '.delay_seconds // 0')
+printf '%s\n' "$entry" | jq -e '(.delay_seconds // 0) | type == "number" and . >= 0 and . <= 2' >/dev/null \
+    || refuse 'delay must be between zero and two seconds'
+if [ "$delay" != 0 ]; then sleep "$delay"; fi
+emit() {
+    printf '%s\n' "$entry" | jq -r --arg field "$1" \
+        '.[$field] | if . == null or . == "" then empty elif type == "string" then . else tojson end'
+}
+emit stdout
+emit stderr >&2
+exit "$(printf '%s\n' "$entry" | jq -r '.status')"

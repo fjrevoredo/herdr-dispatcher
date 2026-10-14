@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+# Enable once per clone with:
+#   git config core.hooksPath .githooks
+#
+# This repository is personal. The global ~/.gitconfig resolves to a work identity,
+# so a fresh clone or worktree would silently commit with the wrong author.
+# This hook rejects any commit whose author is not the personal identity.
+set -euo pipefail
+
+readonly expected_email="fjrevoredo@gmail.com"
+
+author_ident="$(git var GIT_AUTHOR_IDENT)"
+author_email="$(printf '%s\n' "$author_ident" | sed -n 's/.*<\(.*\)>.*/\1/p')"
+
+if [ "$author_email" != "$expected_email" ]; then
+  echo "pre-commit: author is <$author_email>, expected <$expected_email>." >&2
+  echo "Run the per-clone setup from AGENTS.md:" >&2
+  echo "  git config user.email $expected_email" >&2
+  echo "  git config user.name \"Francisco J. Revoredo\"" >&2
+  exit 1
+fi

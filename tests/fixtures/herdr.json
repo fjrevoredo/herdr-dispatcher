@@ -1,0 +1,27 @@
+{
+  "agent_list": {
+    "id": "test-1",
+    "result": {
+      "type": "agent_list",
+      "agents": [{"pane_id":"wTest:p1","terminal_id":"term_test","workspace_id":"wTest","tab_id":"tTest","agent":"pi","agent_session":{"agent":"pi","kind":"path","source":"herdr:pi","value":"/offline/sessions/test.jsonl"},"agent_status":"idle","cwd":"/offline/project","foreground_cwd":"/offline/project","state_change_seq":1}]
+    }
+  },
+  "pane_current": {
+    "id": "test-2",
+    "result": {"type":"pane_current","pane":{"pane_id":"wTest:p1","terminal_id":"term_test","workspace_id":"wTest","tab_id":"tTest","agent":"pi","agent_session":{"agent":"pi","kind":"path","source":"herdr:pi","value":"/offline/sessions/test.jsonl"},"agent_status":"idle","cwd":"/offline/project","foreground_cwd":"/offline/project","state_change_seq":1}}
+  },
+  "process_info": {
+    "id": "test-3",
+    "result": {"type":"pane_process_info","process_info":{"pane_id":"wTest:p1","shell_pid":4100,"foreground_process_group_id":4200,"foreground_processes":[{"pid":4201,"name":"pi","argv0":"pi","cwd":"/offline/project"}]}}
+  },
+  "workspace_create": {
+    "id": "test-4",
+    "result": {"workspace":{"workspace_id":"wTest"},"tab":{"workspace_id":"wTest","tab_id":"tTest"},"root_pane":{"workspace_id":"wTest","tab_id":"tTest","pane_id":"wTest:p1"}}
+  },
+  "tab_create": {
+    "id": "test-5",
+    "result": {"tab":{"workspace_id":"wTest","tab_id":"tNext"},"root_pane":{"workspace_id":"wTest","tab_id":"tNext","pane_id":"wTest:p2"}}
+  },
+  "agent_blocked": {"id":"test-6","error":{"code":"agent_blocked","message":"Test agent is blocked"}},
+  "pane_not_found": {"id":"test-7","error":{"code":"pane_not_found","message":"Test pane was not found"}}
+}
