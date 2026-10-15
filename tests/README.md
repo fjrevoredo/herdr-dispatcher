@@ -1,7 +1,7 @@
 # Offline shell tests
 
 Run `bash tests/run.sh` for all tests. Pass test names or groups (`runner`,
-`shell`, `fake`, `state`, `ring`, `spawn`, `blockers`) to select tests. Unknown or empty selections exit 2. A failed
+`shell`, `fake`, `state`, `ring`, `spawn`, `blockers`, `client_contract`) to select tests. Unknown or empty selections exit 2. A failed
 case exits 1. The deliberate failure is available only to the inner runner
 self-test, never to the default suite.
 
@@ -124,3 +124,13 @@ Startup reuse fixtures use the current UTC time. Expiry fixtures use old
 saved timestamps. The production clock has one-second precision, so retry
 budgets must not increase, but need not decrease on every call. These tests
 do not prove live agent readiness, trust behavior, or model actions.
+
+## Requester contracts
+
+Run `bash tests/run.sh client_contract` for caller context, moved-pane identity,
+managed-requester denial, exact RESULT/FAILED paths, and request retention after
+an uncertain wake. Example body files under `fixtures/requests/` and report
+bodies under `fixtures/reports/` cover both roles. Tests generate matching
+frontmatter from sandbox records and validate reports through the real helper.
+They do not prove skill discovery, model routing, or repeated-notice handling.
+Those checks need separate approved live pi/Claude sessions.

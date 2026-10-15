@@ -764,7 +764,11 @@ Kinds and limits come from validated config/role metadata. Result is
 on success. For reused registered dispatcher launch_id may be null. Failed/uncertain result has
 these keys with null for unknown values, plus `phase` from journal and `reservation_retained`.
 A capacity conflict uses `error.code=capacity_full` (new run remains queued). Ready owned same-cwd
-reuse is permitted; incompatible/expired workers return `retirement_required`, never a blind close.
+reuse is permitted. Spawn can automatically retire a proven unassigned, settled owned worker
+when its effective kind, config, or cwd is incompatible, or its effective idle TTL has expired.
+Retirement checks the saved occupant and ownership before closure, then rescans within the same
+startup budget. Refused or uncertain retirement stops routing and retains the evidence; it never
+permits a blind close or a second worker to bypass a reservation.
 Do not assign or ring from spawn. Reconcile unresolved launch records before new side effects.
 
 ### 12.6 `bin/setup`
@@ -932,6 +936,7 @@ These are protocol checks, not claims of executed runtime tests.
 | Final result, crash before done | Valid `result.md`, status dispatched | Validate saved assignment, CAS done and pending RESULT. Worker exit does not invalidate report. |
 | Done/relayed status, crash before worker release | Valid result/status with worker_release held; worker still cached occupied | worker-sync verifies same idle/done occupant, persists released/observed_at first, then sets idle_since independent of notice. No release if still working/unknown (§7). |
 | Crash after release status, before worker cache | Status worker_release released with first observed_at; cache still occupied | worker-sync rebuilds idle cache from that timestamp if there is no newer held assignment. Never reset the TTL or treat historical assignment as active. |
+| Gone worker retirement crash | Status release retired, then launch closed, then worker cache gone; any later write may be missing | worker-sync proves absence outside the state lock, preserves the first release observation, closes the matching historical launch before marking the cache gone, and retains assignment/ownership. A closed launch proves historical ownership across workspace changes even before cache repair; a live occupant with that closed launch is not reusable. |
 | Completed worker, gone requester | Valid report, state done, missing requester evidence | Persist missing-requester notice phase; alert once; retain report. Release settled worker; do not fail run or hold capacity for relay. |
 | Relay input, crash before sent | Notice pending/in_flight with attempt/time | Treat as uncertain; retry hint fairly on later turns. Duplicate reading remains possible. Never infer handling or duplicate assignment (§6, §11). |
 | Nudge input, crash before sent | Nudge sending/token | Inspect; no second nudge. Valid report completes; absent proof goes to human. Do not fail merely because idle. |

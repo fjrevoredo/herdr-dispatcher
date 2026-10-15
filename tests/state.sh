@@ -1,6 +1,59 @@
 #!/bin/bash
 # Task 2.1 contract tests. Sourced by run.sh; never use live CLI state.
 
+gone_worker_sync_recovers_crash_gaps() {
+    local gap
+    for gap in release journal; do
+        state_setup; owned_worker; assigned_run; valid_report; live_rules none
+        jq '. + [{persistent:true,argv:["agent","get","wDispatch:p2"],status:1,stdout:null,stderr:{error:{code:"pane_not_found",message:"Synthetic missing pane"}}}]' "$FAKE_HERDR_SCENARIO" > "$TEST_ROOT/next.json"
+        mv "$TEST_ROOT/next.json" "$FAKE_HERDR_SCENARIO"
+        jq --arg at "$TEST_NOW" '.state="done" | .notice.type="RESULT" | .notice.phase="pending" | .worker_release={phase:"retired",observed_at:$at,reason:"worker_gone"}' "$RUN_ROOT/$RUN_ID/status" > "$TEST_ROOT/next.json"
+        mv "$TEST_ROOT/next.json" "$RUN_ROOT/$RUN_ID/status"
+        if [ "$gap" = journal ]; then
+            jq '.phase="closed"' "$RUN_ROOT/.launches/22222222222222222222222222222222.json" > "$TEST_ROOT/next.json"
+            mv "$TEST_ROOT/next.json" "$RUN_ROOT/.launches/22222222222222222222222222222222.json"
+            # Historical proof must survive workspace removal before cache repair.
+            mv "$RUN_ROOT/.workspace.json" "$TEST_ROOT/old-workspace"
+        fi
+        cp "$RUN_ROOT/$RUN_ID/status" "$TEST_ROOT/status-before"
+        advance_time '2026-10-14T14:15:00Z'
+        helper run-state worker-sync review-1 --expect-revision 0
+        expect_status 0
+        cmp "$TEST_ROOT/status-before" "$RUN_ROOT/$RUN_ID/status"
+        assert_json "$RUN_ROOT/.workers/review-1" '.lifecycle == "gone" and .active_run_id == null'
+        assert_json "$RUN_ROOT/.launches/22222222222222222222222222222222.json" '.phase == "closed"'
+        registry_ok
+        assert_json "$TEST_ROOT/helper.json" '.result.issues == [] and .result.workers[0].classification == "closed" and .result.runs[0].result_valid'
+        mv "$RUN_ROOT/$RUN_ID" "$TEST_ROOT/crashed-$gap"
+    done
+}
+
+gone_worker_sync_closes_journal() {
+    local state
+    for state in 'done' failed; do
+        state_setup; owned_worker; assigned_run; valid_report; live_rules none
+        jq '. + [{persistent:true,argv:["agent","get","wDispatch:p2"],status:1,stdout:null,stderr:{error:{code:"pane_not_found",message:"Synthetic missing pane"}}}]' "$FAKE_HERDR_SCENARIO" > "$TEST_ROOT/next.json"
+        mv "$TEST_ROOT/next.json" "$FAKE_HERDR_SCENARIO"
+        jq --arg state "$state" --arg at "$TEST_NOW" '.state=$state | .notice.phase="pending" | .notice.type=(if $state == "done" then "RESULT" else "FAILED" end) | .error=(if $state == "failed" then {code:"worker_gone",message:"Synthetic",at:$at} else null end)' "$RUN_ROOT/$RUN_ID/status" > "$TEST_ROOT/next.json"
+        mv "$TEST_ROOT/next.json" "$RUN_ROOT/$RUN_ID/status"
+        helper run-state worker-sync review-1 --expect-revision 0
+        expect_status 0
+        assert_json "$RUN_ROOT/$RUN_ID/status" '.worker_release.phase == "retired" and .assignment != null'
+        assert_json "$RUN_ROOT/.workers/review-1" '.lifecycle == "gone" and .active_run_id == null'
+        assert_json "$RUN_ROOT/.launches/22222222222222222222222222222222.json" '.phase == "closed" and .identity != null and .ownership_token != null'
+        registry_ok
+        assert_json "$TEST_ROOT/helper.json" '.result.workers[0].classification == "closed" and .result.issues == [] and .result.runs[0].result_valid'
+        # A repeated sync must retain the first release observation and ownership.
+        cp "$RUN_ROOT/$RUN_ID/status" "$TEST_ROOT/status-before"
+        advance_time '2026-10-14T14:15:00Z'
+        helper run-state worker-sync review-1 --expect-revision 1
+        expect_status 0
+        cmp "$TEST_ROOT/status-before" "$RUN_ROOT/$RUN_ID/status"
+        # The second iteration creates the same synthetic run afresh.
+        mv "$RUN_ROOT/$RUN_ID" "$TEST_ROOT/finished-$state"
+    done
+}
+
 live_identity_gaps_retained() {
     state_setup; owned_worker; assigned_run; live_rules worker
     jq 'map(if .argv == ["agent","list"] then .stdout.result.agents += [(.stdout.result.agents[0] | .pane_id="wOther:p9" | .terminal_id="term_other" | .agent_session=null | .name="other")] else . end)' "$FAKE_HERDR_SCENARIO" > "$TEST_ROOT/next.json"

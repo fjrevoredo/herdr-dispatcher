@@ -108,8 +108,9 @@ st_owned() {
         .workspace_id == $r.workspace_id and .tab_id == $r.tab_id and .pane_id == $r.pane_id and
         .identity == $r.identity and $r.identity != null and (.phase | IN("ready","closing","closed")) and
         (if ($r.lifecycle | IN("closed","gone")) then .phase == "closed" else true end)' "$HD_RUN_ROOT/.launches/$launch.json" >/dev/null || return 3
-    # Retired workers retain their launch proof across workspace incarnations.
-    if printf '%s\n' "$record" | jq -e '.lifecycle | IN("closed","gone")' >/dev/null; then return 0; fi
+    # A closed journal preserves historical ownership even if a crash left the
+    # worker cache unchanged, or the workspace has since been replaced.
+    if jq -e '.phase == "closed"' "$HD_RUN_ROOT/.launches/$launch.json" >/dev/null; then return 0; fi
     hd_safe_file "$HD_RUN_ROOT/.workspace.json" && hd_json_validate workspace "$HD_RUN_ROOT/.workspace.json" || return 3
     workspace=$(jq -c . "$HD_RUN_ROOT/.workspace.json") || return 6
     printf '%s\n' "$workspace" | jq -e --argjson r "$record" --arg config "$HD_CONFIG_PATH" '.workspace_id == $r.workspace_id and .config_path == $config and .lifecycle == "ready"' >/dev/null || return 3
@@ -216,6 +217,8 @@ st_disk_scan() {
             live=$(jq -c --argjson r "$record" '[.[] | select(.identity == $r.identity and .workspace_id == $r.workspace_id and .tab_id == $r.tab_id and .cwd == $r.cwd)] | if length == 1 then .[0] else null end' "$HD_PRIVATE/live.json")
             if st_owned "$record" && [ "$(printf '%s\n' "$held" | jq length)" -le 1 ]; then
                 if printf '%s\n' "$record" | jq -e '.lifecycle == "closed" or .lifecycle == "gone"' >/dev/null; then classification=closed
+                elif [ "$live" != null ] && jq -e '.phase == "closed"' "$HD_RUN_ROOT/.launches/$(printf '%s\n' "$record" | jq -r .ownership.launch_id).json" >/dev/null; then
+                    classification=quarantined
                 elif [ "$live" = null ]; then
                     if jq -e --argjson r "$record" 'any(.[]; .pane_id == $r.pane_id or .terminal_id == $r.identity.terminal_id)' "$HD_PRIVATE/agents.json" >/dev/null; then classification=quarantined
                     else classification=stale; fi

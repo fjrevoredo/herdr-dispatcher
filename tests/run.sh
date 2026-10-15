@@ -13,6 +13,8 @@ source "$TEST_REPO/tests/ring.sh"
 source "$TEST_REPO/tests/spawn.sh"
 # shellcheck disable=SC1091
 source "$TEST_REPO/tests/blockers.sh"
+# shellcheck disable=SC1091
+source "$TEST_REPO/tests/client.sh"
 
 runner_self_test() {
     local status=0
@@ -37,7 +39,7 @@ no_test_selector_rejected() {
 
 shell_files() {
     local file
-    for file in tests/run.sh tests/lint.sh tests/helpers.sh tests/state.sh tests/spawn.sh tests/fake-bin/herdr tests/fixtures/collision-date tests/fixtures/collision-od .githooks/pre-commit; do
+    for file in tests/run.sh tests/lint.sh tests/helpers.sh tests/state.sh tests/spawn.sh tests/client.sh tests/fake-bin/herdr tests/fixtures/collision-date tests/fixtures/collision-od .githooks/pre-commit; do
         [ -x "$TEST_REPO/$file" ] || fail "not executable: $file"
         /bin/bash -n "$TEST_REPO/$file"
     done
@@ -162,7 +164,7 @@ fake_concurrent_queue() {
 
 names=(runner_self_test no_test_selector_rejected shell_files fake_cli fake_safety fixture_shapes fake_persistent_reads fake_concurrent_queue)
 groups=(runner runner shell fake fake fake fake fake)
-state_names=(notice_retries_remain_valid live_identity_gaps_retained stale_nonempty_idle_recovered malformed_release_blocks_assignment status_cross_fields_validated concurrent_run_ids existing_run_never_overwritten unpublished_run_ignored partial_result_ignored wrong_run_result_rejected wrong_worker_result_rejected invalid_transition_rejected malformed_metadata_reported path_escape_rejected unrelated_named_agent_excluded missing_identity_quarantined stale_worker_reported failure_relay_retained duplicate_worker_assignment_rejected crash_between_state_files)
+state_names=(gone_worker_sync_recovers_crash_gaps gone_worker_sync_closes_journal notice_retries_remain_valid live_identity_gaps_retained stale_nonempty_idle_recovered malformed_release_blocks_assignment status_cross_fields_validated concurrent_run_ids existing_run_never_overwritten unpublished_run_ignored partial_result_ignored wrong_run_result_rejected wrong_worker_result_rejected invalid_transition_rejected malformed_metadata_reported path_escape_rejected unrelated_named_agent_excluded missing_identity_quarantined stale_worker_reported failure_relay_retained duplicate_worker_assignment_rejected crash_between_state_files)
 for name in "${state_names[@]}"; do names+=("$name"); groups+=(state); done
 ring_names=(ring_success_literal busy_target_not_prompted concurrent_ringers_serialized alias_lock_shared blocked_target_not_typed total_deadline_bounded signal_releases_own_lock live_lock_not_stolen dead_lock_recovered ambiguous_delivery_not_resent replaced_target_under_lock_not_prompted self_target_rejected hung_query_deadline_bounded ring_ownership_required ring_expected_required released_dead_owner_retried worker_record_disappears_while_waiting requester_result_input_accepted registered_dispatcher_reconcile ring_common_options working_ack_identity_required)
 for name in "${ring_names[@]}"; do names+=("$name"); groups+=(ring); done
@@ -170,7 +172,9 @@ spawn_names=(spawn_startup_success spawn_dispatcher_success busy_shell_retry_bou
 for name in "${spawn_names[@]}"; do names+=("$name"); groups+=(spawn); done
 blocker_names=(closed_worker_workspace_replacement retired_worker_historical_launch_required nonterminal_worker_workspace_proof_required registration_journal_gap_uncertain registration_journal_gap_observed registration_journal_gap_mismatch_refused ring_worker_created_workspace_dispatcher)
 for name in "${blocker_names[@]}"; do names+=("$name"); groups+=(blockers); done
-group_names=(runner shell fake state ring spawn blockers)
+client_names=(missing_context missing_config moved_caller_resolved managed_requester_rejected foreign_result_path_rejected failure_path_validated preserved_run_after_ring_timeout client_role_fixtures)
+for name in "${client_names[@]}"; do names+=("$name"); groups+=(client_contract); done
+group_names=(runner shell fake state ring spawn blockers client_contract)
 if [ "${TEST_RUNNER_INNER:-0}" = 1 ]; then group_names+=(--inner-empty); fi
 selectors=("$@")
 if [ "$#" -eq 0 ]; then selectors=(all); fi

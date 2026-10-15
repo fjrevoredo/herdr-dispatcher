@@ -249,6 +249,8 @@ st_notice() {
     ST_KEY=$id; st_path run "$id" || return 2
     case "$type" in RESULT) [ "$path" = "$HD_RUN_ROOT/$id/result.md" ] || return 2 ;; FAILED) [ "$path" = "$ST_PATH" ] || return 2 ;; *) return 2 ;; esac
     st_get || return $?
+    # A successful read is not a successful notice check.
+    ST_OUTCOME=error; ST_RESULT='{}'
     requester=$(st_frontmatter "$HD_RUN_ROOT/$id/request.md" | jq -c .requester) || return 3
     current=$(hd_current_identity) || { rc=$?; st_error identity_unavailable 'Cannot verify current requester' "$rc"; return "$rc"; }
     printf '%s\n' "$requester" | jq -e --argjson current "$current" '. == $current' >/dev/null || { st_error identity_mismatch 'Current occupant is not the saved requester' 3; return 3; }
@@ -268,7 +270,7 @@ st_notice() {
     ST_OUTCOME=ok
 }
 st_sync() {
-    local name=$1 worker old rows row id status updated live held phase observed lifecycle active idle rc committed=false gone=false
+    local name=$1 worker old rows row id status updated live held phase observed lifecycle active idle rc journal committed=false gone=false
     ST_KEY=$name; st_path worker "$name" || return 2; st_load || return $?
     old=$ST_DOCUMENT
     printf '%s\n' "$old" | jq -e '.lifecycle | IN("starting","closing","closed")' >/dev/null && { st_error unimplemented 'Readiness and closure reconciliation require their dedicated proof paths' 3; return 3; }
@@ -285,7 +287,8 @@ st_sync() {
         gone=true
     else
         printf '%s\n' "$live" | jq -e '.agent_status | IN("idle","done","working")' >/dev/null || { st_error quarantine 'Blocked or unknown occupant retains occupancy' 3; return 3; }
-        [ "$(printf '%s\n' "$old" | jq -r .lifecycle)" != gone ] || { st_error quarantine 'Retired occupant cannot be reused' 3; return 3; }
+        [ "$(printf '%s\n' "$old" | jq -r .lifecycle)" != gone ] &&
+            [ "$(jq -r .phase "$HD_RUN_ROOT/.launches/$(printf '%s\n' "$old" | jq -r .ownership.launch_id).json")" != closed ] || { st_error quarantine 'Retired occupant cannot be reused' 3; return 3; }
     fi
     rows=$(jq -c --arg n "$name" --argjson w "$old" '[.[] | select(.status.assignment != null and (.status.assignment.worker_name == $n or .status.assignment.worker.pane_id == $w.pane_id or .status.assignment.worker.terminal_id == $w.identity.terminal_id))]' "$HD_PRIVATE/runs.json")
     printf '%s\n' "$rows" | jq -e --argjson w "$old" 'all(.[]; .status.assignment.worker_name == $w.name and .status.assignment.worker == $w.identity)' >/dev/null || { st_error quarantine 'Conflicting assignment occupant' 3; return 3; }
@@ -349,7 +352,18 @@ st_sync() {
         observed=$(printf '%s\n' "$rows" | jq -r '[.[] | select(.status.worker_release.phase == "released")] | sort_by(.status.assignment.assigned_at,.run_id) | last | .status.worker_release.observed_at // empty')
         [ -z "$observed" ] || idle=$observed
     fi
-    if [ "$gone" = true ]; then idle=''; fi
+    if [ "$gone" = true ]; then
+        idle=''
+        # Release status is authoritative. Close its historical journal before
+        # marking the derived worker cache gone. Either crash gap can be synced.
+        journal="$HD_RUN_ROOT/.launches/$(printf '%s\n' "$old" | jq -r .ownership.launch_id).json"
+        if [ "$(jq -r .phase "$journal")" != closed ]; then
+            jq --arg at "$(hd_now)" '.phase="closed" | .error=null | .revision += 1 | .updated_at=$at' "$journal" > "$HD_PRIVATE/closed-launch.json" || return 6
+            hd_atomic_replace "$journal" "$HD_PRIVATE/closed-launch.json" || return 6
+            committed=true; ST_OUTCOME=uncertain
+            ST_RESULT=$(jq -cn --argjson w "$old" '{worker:$w,committed:true}')
+        fi
+    fi
     [ -n "$idle" ] || [ "$lifecycle" != idle ] || idle=$(hd_now)
     printf '%s\n' "$old" | jq --arg at "$(hd_now)" --arg lifecycle "$lifecycle" --argjson active "$active" --arg idle "$idle" '.revision += 1 | .updated_at=$at | .lifecycle=$lifecycle | .active_run_id=$active | .idle_since=(if $idle == "" then null else $idle end)' > "$HD_PRIVATE/synced.json" || return 6
     if ! hd_atomic_replace "$ST_PATH" "$HD_PRIVATE/synced.json"; then
