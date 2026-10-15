@@ -1,0 +1,8 @@
+#!/bin/bash
+set -eu
+if [ "$*" = '-An -N 8 -tx1 /dev/urandom' ] && [ ! -e "$TEST_ROOT/collision-used" ]; then
+    printf '1\n' > "$TEST_ROOT/collision-used"
+    printf '%s\n' "${TEST_COLLISION_ID#*-}"
+else
+    /usr/bin/od "$@"
+fi

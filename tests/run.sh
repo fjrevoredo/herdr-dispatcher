@@ -5,6 +5,14 @@ export TEST_REPO
 # The absolute checkout path is resolved at runtime.
 # shellcheck disable=SC1091
 source "$TEST_REPO/tests/helpers.sh"
+# shellcheck disable=SC1091
+source "$TEST_REPO/tests/state.sh"
+# shellcheck disable=SC1091
+source "$TEST_REPO/tests/ring.sh"
+# shellcheck disable=SC1091
+source "$TEST_REPO/tests/spawn.sh"
+# shellcheck disable=SC1091
+source "$TEST_REPO/tests/blockers.sh"
 
 runner_self_test() {
     local status=0
@@ -29,7 +37,7 @@ no_test_selector_rejected() {
 
 shell_files() {
     local file
-    for file in tests/run.sh tests/lint.sh tests/helpers.sh tests/fake-bin/herdr .githooks/pre-commit; do
+    for file in tests/run.sh tests/lint.sh tests/helpers.sh tests/state.sh tests/spawn.sh tests/fake-bin/herdr tests/fixtures/collision-date tests/fixtures/collision-od .githooks/pre-commit; do
         [ -x "$TEST_REPO/$file" ] || fail "not executable: $file"
         /bin/bash -n "$TEST_REPO/$file"
     done
@@ -92,11 +100,77 @@ fixture_shapes() {
     assert_envelope "$TEST_ROOT/envelope.json"
     advance_time '2026-10-14T14:15:00Z'
     assert_equal '2026-10-14T14:15:00Z' "$TEST_NOW"
+    state_setup
+    owned_worker
+    assigned_run
+    valid_report
+    # Validate all synthetic records with the production schema, in a child so
+    # lib.sh cleanup traps cannot replace this test's sandbox cleanup trap.
+    /bin/bash -c '
+        set -eu
+        source "$1/bin/lib.sh"
+        hd_json_validate role "$2/repo/roles/review.md"
+        hd_json_validate request "$2/repo/runs/$3/request.md"
+        hd_json_validate status "$2/repo/runs/$3/status"
+        hd_json_validate result "$2/repo/runs/$3/result.md"
+        hd_json_validate worker "$2/repo/runs/.workers/review-1"
+        hd_json_validate workspace "$2/repo/runs/.workspace.json"
+        hd_json_validate launch "$2/repo/runs/.launches/11111111111111111111111111111111.json"
+        hd_json_validate launch "$2/repo/runs/.launches/22222222222222222222222222222222.json"
+    ' _ "$TEST_REPO" "$TEST_ROOT" "$RUN_ID"
 }
 
-names=(runner_self_test no_test_selector_rejected shell_files fake_cli fake_safety fixture_shapes)
-groups=(runner runner shell fake fake fake)
-group_names=(runner shell fake)
+fake_persistent_reads() {
+    local response status=0 a b
+    response=$(fixture agent_list)
+    scenario "$(jq -cn --argjson response "$response" '[{persistent:true,argv:["agent","list"],status:0,stdout:$response,stderr:null}]')"
+    herdr agent list > "$TEST_ROOT/a.json" & a=$!
+    herdr agent list > "$TEST_ROOT/b.json" & b=$!
+    wait "$a"
+    wait "$b"
+    assert_json "$TEST_ROOT/a.json" '.result.type == "agent_list"'
+    assert_json "$TEST_ROOT/b.json" '.result.type == "agent_list"'
+    assert_json "$FAKE_HERDR_SCENARIO" 'length == 1'
+    jq -se 'length == 2 and all(.[]; .argv == ["agent","list"])' "$FAKE_HERDR_LOG" >/dev/null
+    herdr agent get wTest:p1 > "$TEST_ROOT/unexpected.out" 2>&1 || status=$?
+    assert_equal 2 "$status"
+    scenario '[{"persistent":true,"argv":["pane","close","wTest:p1"],"status":0,"stdout":{},"stderr":null}]'
+    status=0
+    herdr pane close wTest:p1 > "$TEST_ROOT/mutation.out" 2>&1 || status=$?
+    assert_equal 2 "$status"
+    assert_json "$FAKE_HERDR_SCENARIO" 'length == 1'
+    scenario '[{"argv":["agent","prompt","wTest:p1","synthetic","--timeout",{"timeout_ms":true}],"status":0,"stdout":{},"stderr":null}]'
+    status=0
+    herdr agent prompt wTest:p1 synthetic --timeout 300001 > "$TEST_ROOT/bounds.out" 2>&1 || status=$?
+    assert_equal 2 "$status"
+    assert_json "$FAKE_HERDR_SCENARIO" 'length == 1'
+    herdr agent prompt wTest:p1 synthetic --timeout 2000 > "$TEST_ROOT/bounded.json"
+    assert_json "$FAKE_HERDR_SCENARIO" 'length == 0'
+}
+
+fake_concurrent_queue() {
+    local a b
+    scenario '[{"argv":["agent","list"],"status":0,"stdout":{"id":"first"},"stderr":null},{"argv":["agent","list"],"status":0,"stdout":{"id":"second"},"stderr":null}]'
+    herdr agent list > "$TEST_ROOT/a.json" & a=$!
+    herdr agent list > "$TEST_ROOT/b.json" & b=$!
+    wait "$a"
+    wait "$b"
+    jq -se 'map(.id) | sort == ["first","second"]' "$TEST_ROOT/a.json" "$TEST_ROOT/b.json" >/dev/null
+    assert_json "$FAKE_HERDR_SCENARIO" 'length == 0'
+    jq -se 'length == 2 and all(.[]; .cli == "fake-herdr")' "$FAKE_HERDR_LOG" >/dev/null
+}
+
+names=(runner_self_test no_test_selector_rejected shell_files fake_cli fake_safety fixture_shapes fake_persistent_reads fake_concurrent_queue)
+groups=(runner runner shell fake fake fake fake fake)
+state_names=(notice_retries_remain_valid live_identity_gaps_retained stale_nonempty_idle_recovered malformed_release_blocks_assignment status_cross_fields_validated concurrent_run_ids existing_run_never_overwritten unpublished_run_ignored partial_result_ignored wrong_run_result_rejected wrong_worker_result_rejected invalid_transition_rejected malformed_metadata_reported path_escape_rejected unrelated_named_agent_excluded missing_identity_quarantined stale_worker_reported failure_relay_retained duplicate_worker_assignment_rejected crash_between_state_files)
+for name in "${state_names[@]}"; do names+=("$name"); groups+=(state); done
+ring_names=(ring_success_literal busy_target_not_prompted concurrent_ringers_serialized alias_lock_shared blocked_target_not_typed total_deadline_bounded signal_releases_own_lock live_lock_not_stolen dead_lock_recovered ambiguous_delivery_not_resent replaced_target_under_lock_not_prompted self_target_rejected hung_query_deadline_bounded ring_ownership_required ring_expected_required released_dead_owner_retried worker_record_disappears_while_waiting requester_result_input_accepted registered_dispatcher_reconcile ring_common_options working_ack_identity_required)
+for name in "${ring_names[@]}"; do names+=("$name"); groups+=(ring); done
+spawn_names=(spawn_startup_success spawn_dispatcher_success busy_shell_retry_bounded spawn_busy_deadline trust_dialog_not_answered create_response_lost_not_repeated config_override_propagated unregistered_dispatcher_refused same_cwd_reuse worker_capacity_reserved different_cwd_replaced expired_worker_replaced wrong_named_agent_refused concurrent_dispatcher_start startup_timeout_preserves_evidence startup_lock_deadline_bounded unrelated_pane_never_closed ready_journal_missing_registration_recovered ambiguous_created_recovery_refuses_start fresh_worker_retirement_refused ambiguous_idle_retirement_refused public_retirement_eligibility replaced_occupant_retirement_refused explicit_dispatcher_registration_reused)
+for name in "${spawn_names[@]}"; do names+=("$name"); groups+=(spawn); done
+blocker_names=(closed_worker_workspace_replacement retired_worker_historical_launch_required nonterminal_worker_workspace_proof_required registration_journal_gap_uncertain registration_journal_gap_observed registration_journal_gap_mismatch_refused ring_worker_created_workspace_dispatcher)
+for name in "${blocker_names[@]}"; do names+=("$name"); groups+=(blockers); done
+group_names=(runner shell fake state ring spawn blockers)
 if [ "${TEST_RUNNER_INNER:-0}" = 1 ]; then group_names+=(--inner-empty); fi
 selectors=("$@")
 if [ "$#" -eq 0 ]; then selectors=(all); fi

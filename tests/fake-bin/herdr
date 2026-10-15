@@ -50,18 +50,64 @@ done
 if [ -z "$target" ] && [ "$#" -ge 3 ]; then
     case "$1 $2" in 'agent get'|'agent read'|'agent prompt'|'agent start'|'pane close'|'tab close') target=$3 ;; esac
 fi
+# Serialize queue consumption and logging. Release before any scripted delay.
+lock="$FAKE_HERDR_SCENARIO.lock"
+[ ! -L "$lock" ] || refuse 'linked scenario lock'
+locked=0
+trap '[ "$locked" -eq 0 ] || rmdir "$lock"' EXIT
+tries=0
+until mkdir "$lock" 2>/dev/null; do
+    tries=$((tries + 1))
+    [ "$tries" -lt 100 ] || refuse 'scenario lock timeout'
+    sleep 0.02
+done
+locked=1
 jq -cn --argjson argv "$argv" --arg target "$target" --arg cwd "$PWD" \
     '{cli:"fake-herdr",argv:$argv,target:$target,cwd:$cwd}' >> "$FAKE_HERDR_LOG"
 
-entry=$(jq -ce 'if type == "array" and length > 0 then .[0] else error("empty scenario") end' "$FAKE_HERDR_SCENARIO") \
-    || refuse 'no scripted response'
-printf '%s\n' "$entry" | jq -e --argjson argv "$argv" \
-    '.argv == $argv and (.status | type == "number" and floor == . and . >= 0 and . <= 255) and has("stdout") and has("stderr")' >/dev/null \
-    || refuse 'unexpected command or invalid scenario'
-# No lock is implied: use separate scenarios for concurrent callers.
-tmp=$(mktemp "$root/scenario.XXXXXX")
-jq '.[1:]' "$FAKE_HERDR_SCENARIO" > "$tmp"
-mv "$tmp" "$FAKE_HERDR_SCENARIO"
+# Persistent rules are read-only. Only the documented timeout argument can vary.
+entry=$(jq -ce --argjson argv "$argv" '
+    def matches:
+        .argv as $want | ($want | length) == ($argv | length) and
+        all(range(0; $want | length); . as $i |
+            if $want[$i] == {timeout_ms:true} then
+                $i > 0 and $want[$i-1] == "--timeout" and
+                ($argv[$i] | test("^[1-9][0-9]{0,5}$") and (tonumber <= 300000))
+            else $want[$i] == $argv[$i] end);
+    if type != "array" then error("invalid scenario")
+    elif .[0].persistent != true then .[0]
+    else [.[] | select(matches)] |
+        if length == 1 then .[0]
+        elif length > 1 and all(.[]; .persistent != true) then .[0]
+        else error("ambiguous or absent rule") end end
+    | select(matches and (.status | type == "number" and floor == . and . >= 0 and . <= 255) and has("stdout") and has("stderr"))
+    ' "$FAKE_HERDR_SCENARIO") || refuse 'unexpected command or invalid scenario'
+if [ "$(printf '%s\n' "$entry" | jq -r '.persistent // false')" = true ]; then
+    case "${1:-} ${2:-}" in
+        'agent list'|'agent get'|'agent read'|'pane current'|'pane process-info'|'workspace list'|'tab list') ;;
+        *) refuse 'persistent mutation rule' ;;
+    esac
+else
+    tmp=$(mktemp "$root/scenario.XXXXXX")
+    jq --argjson entry "$entry" '
+        if .[0].persistent == true then
+            (to_entries | map(select(.value == $entry))[0].key) as $i | .[:$i] + .[$i+1:]
+        else .[1:] end |
+        if $entry.after_agent_status != null then
+            map(if .argv == ["agent","list"] then
+                .stdout.result.agents |= map(if .pane_id == $entry.argv[2] then .agent_status=$entry.after_agent_status else . end)
+            else . end)
+        else . end |
+        if $entry.after_agent_list != null then
+            map(if .argv == ["agent","list"] then .stdout.result.agents=$entry.after_agent_list else . end)
+        else . end |
+        if $entry.after_workspace_list != null then
+            map(if .argv == ["workspace","list"] then .stdout.result.workspaces=$entry.after_workspace_list else . end)
+        else . end' "$FAKE_HERDR_SCENARIO" > "$tmp"
+    mv "$tmp" "$FAKE_HERDR_SCENARIO"
+fi
+rmdir "$lock"
+locked=0
 delay=$(printf '%s\n' "$entry" | jq -r '.delay_seconds // 0')
 printf '%s\n' "$entry" | jq -e '(.delay_seconds // 0) | type == "number" and . >= 0 and . <= 2' >/dev/null \
     || refuse 'delay must be between zero and two seconds'

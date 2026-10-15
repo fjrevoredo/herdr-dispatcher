@@ -1,0 +1,431 @@
+#!/bin/bash
+# Durable state operations. Task text and reports are data, never shell input.
+# shellcheck disable=SC1091,SC2034,SC2015
+source "$(cd "$(dirname "$0")" && pwd -P)/spawn-lib.sh"
+
+# The replacement is checked with jq; no executable patch language is accepted.
+st_cas_run() {
+    local old=$1 next=$2 old_state next_state
+    printf '%s\n' "$next" | jq -e --argjson o "$old" '
+        def attempt_ok($a; $b):
+            if $a == $b then true
+            elif $b.phase == "sending" then
+                ($a.phase == "none" or $a.phase == "not-submitted") and
+                $b.attempt_id != null and $b.attempt_id != $a.attempt_id and $b.started_at != null and $b.acknowledged_at == null and $b.error == null
+            else $a.phase == "sending" and ($b.phase == "sent" or $b.phase == "uncertain" or $b.phase == "not-submitted") and
+                $b.attempt_id == $a.attempt_id and $b.started_at == $a.started_at and
+                (if $b.phase == "sent" then $b.acknowledged_at != null else $b.acknowledged_at == null end) end;
+        . as $n |
+        .run_id == $o.run_id and .created_at == $o.created_at and .revision == $o.revision and
+        .assignment == $o.assignment and .worker_release == $o.worker_release and
+        (if .state == "new" then .assignment == null and .worker_release.phase == "none" else (.state == "failed" or .assignment != null) end) and
+        (if .notice.phase == "sent" and .notice.type == "RESULT" then .state == "relayed" else true end) and
+        all(["attention","missing_requester","late_result"][]; . as $k | ($o.human[$k] | not) or $n.human[$k]) and
+        (if .delivery != $o.delivery then $o.state == "dispatched" else true end) and
+        attempt_ok($o.delivery; .delivery) and attempt_ok(($o.nudge | del(.settled_observed_at)); (.nudge | del(.settled_observed_at))) and
+        (if .nudge != $o.nudge then $o.delivery.phase == "sent" and $o.assignment != null else true end) and
+        (if $o.nudge.settled_observed_at != null then .nudge.settled_observed_at == $o.nudge.settled_observed_at
+         elif .nudge.settled_observed_at != null then $o.nudge.phase == "sent" and .nudge.phase == "sent" and .nudge.attempt_id == $o.nudge.attempt_id
+         else true end) and
+        (if .nudge != $o.nudge then $o.state == "dispatched" and ($o.nudge.settled_observed_at == null) else true end) and
+        (if .assignment == null then .delivery.phase == "none" and .nudge.phase == "none" else .delivery.phase != "none" end) and
+        .notice.attempts >= $o.notice.attempts and
+        (if .notice == $o.notice then true
+         elif $o.notice.phase == "none" then
+             .notice.phase == "pending" and .notice.attempts == 0 and .notice.attempt_id == null and .notice.last_attempt_at == null and .notice.in_flight == false and .notice.last_outcome == null and .notice.error == null
+         elif .notice.in_flight then
+             ($o.notice.phase == "pending" or $o.notice.phase == "missing-requester") and
+             .notice.phase == "pending" and .notice.type == $o.notice.type and
+             .notice.attempts == $o.notice.attempts + 1 and .notice.attempt_id != null and .notice.attempt_id != $o.notice.attempt_id and .notice.last_attempt_at != null
+         else $o.notice.in_flight and .notice.type == $o.notice.type and
+             .notice.attempts == $o.notice.attempts and .notice.attempt_id == $o.notice.attempt_id and
+             .notice.last_attempt_at == $o.notice.last_attempt_at and
+             (if .notice.last_outcome == "input-accepted" then .notice.phase == "sent"
+              elif .notice.last_outcome == "missing-requester" then .notice.phase == "missing-requester"
+              else (.notice.last_outcome == "uncertain" or .notice.last_outcome == "not-submitted") and .notice.phase == "pending" end)
+         end) and
+        (if .state == "done" or .state == "relayed" then .assignment != null and .notice.type == "RESULT"
+         elif .state == "failed" then .error != null and .notice.type == "FAILED"
+         else .notice.type == null and .notice.phase == "none" end)
+        ' >/dev/null || { st_error invariant_violation 'Replacement violates run invariants' 3; return 3; }
+    if ! printf '%s\n' "$next" | jq -e --argjson o "$old" '.nudge == $o.nudge' >/dev/null; then
+        if st_report "$ST_KEY" "$old"; then st_error valid_report_present 'Valid report forbids a missing-report nudge' 3; return 3; fi
+        if printf '%s\n' "$next" | jq -e --argjson o "$old" '.nudge.settled_observed_at != $o.nudge.settled_observed_at' >/dev/null; then
+            [ "${ST_SETTLED_PROVED:-false}" = true ] || return 3
+        fi
+    fi
+    old_state=$(printf '%s\n' "$old" | jq -r .state)
+    next_state=$(printf '%s\n' "$next" | jq -r .state)
+    case "$old_state:$next_state" in
+        new:new|dispatched:dispatched|done:done|relayed:relayed|failed:failed) ;;
+        dispatched:done)
+            st_report "$ST_KEY" "$old" || { st_error invalid_report 'A valid assigned report is required' 3; return 3; }
+            printf '%s\n' "$next" | jq -e '.notice.phase == "pending" and .notice.attempts == 0 and .error == null' >/dev/null || return 3 ;;
+        done:relayed)
+            st_report "$ST_KEY" "$old" || return 3
+            printf '%s\n' "$next" | jq -e --argjson o "$old" '$o.notice.in_flight and .notice.phase == "sent" and .notice.last_outcome == "input-accepted" and .notice.attempt_id == $o.notice.attempt_id' >/dev/null || return 3 ;;
+        new:failed)
+            printf '%s\n' "$next" | jq -e '.notice.phase == "pending" and .notice.attempts == 0 and .notice.in_flight == false' >/dev/null || return 3
+            printf '%s\n' "$next" | jq -e '.error.code | IN("invalid_role","no_role_match","startup_rejected","not_submitted")' >/dev/null || { st_error failure_proof_required 'Unsupported failure reason' 3; return 3; } ;;
+        dispatched:failed)
+            printf '%s\n' "$next" | jq -e '.notice.phase == "pending" and .notice.attempts == 0 and .notice.in_flight == false' >/dev/null || return 3
+            if ! printf '%s\n' "$next" | jq -e --argjson o "$old" '.error.code == "not_submitted" and $o.delivery.phase == "not-submitted"' >/dev/null; then
+                case "$(printf '%s\n' "$next" | jq -r .error.code)" in
+                    worker_gone) [ "${ST_GONE_PROVED:-false}" = true ] || return 3 ;;
+                    missing_report) [ "${ST_SETTLED_PROVED:-false}" = true ] && printf '%s\n' "$old" | jq -e '.nudge.phase == "sent" and .nudge.settled_observed_at != null' >/dev/null || return 3 ;;
+                    *) st_error failure_proof_required 'Failure needs conclusive exit or settled nudge evidence' 3; return 3 ;;
+                esac
+                if st_report "$ST_KEY" "$old"; then st_error valid_report_present 'Valid report forbids automatic failure' 3; return 3; fi
+            fi ;;
+        *) st_error invalid_transition 'Run transition is not permitted' 3; return 3 ;;
+    esac
+    if printf '%s\n' "$next" | jq -e '.human.late_result' >/dev/null && ! printf '%s\n' "$old" | jq -e '.human.late_result' >/dev/null; then
+        [ "$old_state" = failed ] && st_report "$ST_KEY" "$old" || return 3
+    fi
+}
+st_get() {
+    st_load || return $?
+    if [ "$ST_TYPE" = status ]; then
+        hd_safe_file "$(dirname "$ST_PATH")/request.md" && hd_json_validate request "$(dirname "$ST_PATH")/request.md" || return 3
+        st_frontmatter "$(dirname "$ST_PATH")/request.md" | jq -e --argjson s "$ST_DOCUMENT" '.run_id == $s.run_id and .created_at == $s.created_at' >/dev/null || return 3
+    fi
+    ST_RESULT=$(jq -cn --argjson document "$ST_DOCUMENT" --arg path "$ST_PATH" '{document:$document,path:$path}')
+    ST_OUTCOME=ok
+}
+# All live evidence is collected before state lock. The disk snapshot and saved
+# identity are then frozen under CAS. No live query can hold the state lock.
+st_prepare_run_proof() {
+    local old=$1 next=$2 identity worker pane
+    ST_GONE_PROVED=false; ST_SETTLED_PROVED=false; ST_SCAN_PROOF=false
+    if printf '%s\n' "$next" | jq -e --argjson o "$old" '((.nudge == $o.nudge) or ($o.nudge.phase == "sending" and .nudge.phase != "sending" and .nudge.settled_observed_at == $o.nudge.settled_observed_at)) and (.state != "failed" or .error.code == "not_submitted" or $o.state != "dispatched")' >/dev/null; then return 0; fi
+    identity=$(printf '%s\n' "$old" | jq -c .assignment.worker)
+    [ "$identity" != null ] || return 3
+    st_live_scan || return $?
+    st_disk_scan || return $?
+    worker=$(jq -c --argjson i "$identity" '[.[] | select(.record.identity == $i)] | if length == 1 then .[0] else null end' "$HD_PRIVATE/workers.json")
+    [ "$worker" != null ] && st_owned "$(printf '%s\n' "$worker" | jq -c .record)" || { st_error quarantine 'Assignment ownership cannot be proved' 3; return 3; }
+    if printf '%s\n' "$next" | jq -e '.state == "failed" and .error.code == "worker_gone"' >/dev/null; then
+        st_gone_proof "$identity" || return $?
+        ST_GONE_PROVED=true
+    else
+        printf '%s\n' "$worker" | jq -e '.live != null and (.live.agent_status | IN("idle","done"))' >/dev/null || { st_error quarantine 'Same settled occupant is required' 3; return 3; }
+        if st_report "$ST_KEY" "$old"; then st_error valid_report_present 'Report already exists' 3; return 3; fi
+        # Scheduling requires inspection of visible output, never blind job replay.
+        if printf '%s\n' "$next" | jq -e --argjson o "$old" '.nudge.phase == "sending" and .nudge != $o.nudge' >/dev/null; then
+            pane=$(printf '%s\n' "$identity" | jq -r .pane_id)
+            hd_cli_read agent read "$pane" --source visible --lines 120 || return $?
+            jq -e '.result | type == "object" and .type == "agent_read"' "$HD_CHILD_STDOUT" >/dev/null || { st_error adapter_schema 'Invalid visible-output response' 6; return 6; }
+        fi
+        if printf '%s\n' "$next" | jq -e --argjson o "$old" '(.nudge.settled_observed_at != $o.nudge.settled_observed_at) or (.state == "failed" and .error.code == "missing_report")' >/dev/null; then
+            printf '%s\n' "$old" | jq -e --arg at "$(hd_now)" '.nudge.phase == "sent" and .nudge.acknowledged_at != null and .nudge.acknowledged_at < $at' >/dev/null || { st_error failure_proof_required 'Nudge must settle on a later observation' 3; return 3; }
+            ST_SETTLED_PROVED=true; ST_SETTLED_AT=$(hd_now)
+        fi
+    fi
+    ST_SCAN_PROOF=true
+}
+st_prepare_readiness() {
+    local old=$1 next=$2 identity live journal workspace launch
+    ST_READY_PROVED=false
+    printf '%s\n' "$next" | jq -e --argjson o "$old" '$o.identity == null and .identity != null and .pane_id == .identity.pane_id and .kind == .identity.kind' >/dev/null || return 3
+    case "$ST_TYPE" in
+        worker)
+            printf '%s\n' "$next" | jq -e --argjson o "$old" '$o.lifecycle == "starting" and (.lifecycle | IN("ready","idle")) and .active_run_id == null and del(.identity,.lifecycle,.idle_since,.error) == ($o | del(.identity,.lifecycle,.idle_since,.error))' >/dev/null || return 3 ;;
+        dispatcher)
+            printf '%s\n' "$next" | jq -e --argjson o "$old" '$o.lifecycle == "starting" and .lifecycle == "ready" and .ownership.mode == "created" and del(.identity,.lifecycle,.error) == ($o | del(.identity,.lifecycle,.error))' >/dev/null || return 3 ;;
+        launch)
+            printf '%s\n' "$next" | jq -e --argjson o "$old" '$o.phase == "starting" and .phase == "ready" and .ownership_mode == "created" and del(.identity,.phase,.error) == ($o | del(.identity,.phase,.error))' >/dev/null || return 3 ;;
+        *) return 3 ;;
+    esac
+    st_live_scan || return $?
+    st_disk_scan || return $?
+    identity=$(printf '%s\n' "$next" | jq -c .identity)
+    live=$(jq -c --argjson i "$identity" '[.[] | select(.identity == $i)] | if length == 1 then .[0] else null end' "$HD_PRIVATE/live.json")
+    printf '%s\n' "$live" | jq -e --argjson n "$next" '. != null and .workspace_id == $n.workspace_id and .tab_id == $n.tab_id and .cwd == $n.cwd and (.agent_status | IN("idle","done"))' >/dev/null || return 3
+    if [ "$ST_TYPE" = launch ]; then journal=$old; else
+        launch=$(printf '%s\n' "$old" | jq -r .ownership.launch_id)
+        hd_safe_file "$HD_RUN_ROOT/.launches/$launch.json" && hd_json_validate launch "$HD_RUN_ROOT/.launches/$launch.json" || return 3
+        journal=$(jq -c . "$HD_RUN_ROOT/.launches/$launch.json")
+    fi
+    printf '%s\n' "$journal" | jq -e --argjson n "$next" --arg config "$HD_CONFIG_PATH" '
+        .ownership_mode == "created" and (.phase | IN("starting","ready")) and .name == $n.name and .kind == $n.kind and .cwd == $n.cwd and .config_path == $config and $n.config_path == $config and
+        .workspace_id == $n.workspace_id and .tab_id == $n.tab_id and .pane_id == $n.pane_id and
+        (.identity == null or .identity == $n.identity) and .ownership_token == ($n.ownership.token // $n.ownership_token) and .launch_id == ($n.ownership.launch_id // $n.launch_id)' >/dev/null || return 3
+    hd_safe_file "$HD_RUN_ROOT/.workspace.json" && hd_json_validate workspace "$HD_RUN_ROOT/.workspace.json" || return 3
+    workspace=$(jq -c . "$HD_RUN_ROOT/.workspace.json")
+    printf '%s\n' "$workspace" | jq -e --argjson n "$next" '.workspace_id == $n.workspace_id and .config_path == $n.config_path and .lifecycle == "ready"' >/dev/null || return 3
+    launch=$(printf '%s\n' "$workspace" | jq -r .launch_id)
+    hd_safe_file "$HD_RUN_ROOT/.launches/$launch.json" && hd_json_validate launch "$HD_RUN_ROOT/.launches/$launch.json" || return 3
+    jq -e --argjson w "$workspace" '.ownership_mode == "created" and .ownership_token == $w.ownership_token and .workspace_id == $w.workspace_id and .tab_id == $w.initial_tab_id and .pane_id == $w.initial_pane_id' "$HD_RUN_ROOT/.launches/$launch.json" >/dev/null || return 3
+    ST_READY_PROVED=true; ST_SCAN_PROOF=true
+}
+st_cas() {
+    local old next document=$ST_FILE rc prepared=''
+    hd_safe_file "$document" || return 2
+    cp -- "$document" "$HD_PRIVATE/replacement.json" || return 6
+    hd_json_validate "$ST_TYPE" "$HD_PRIVATE/replacement.json" || { st_error invalid_document 'Replacement schema is invalid' 2; return 2; }
+    next=$(jq -c . "$HD_PRIVATE/replacement.json") || return 6
+    if [ "$ST_EXPECT" = absent ]; then st_error unimplemented 'Record creation requires the spawn or registration path, not general CAS' 3; return 3; fi
+    ST_SCAN_PROOF=false
+    st_load || return $?
+    prepared=$ST_DOCUMENT
+    ST_READY_PROVED=false
+    if [ "$ST_TYPE" = status ]; then st_prepare_run_proof "$prepared" "$next" || return $?;
+    elif ! printf '%s\n' "$next" | jq -e --argjson o "$prepared" 'del(.error) == ($o | del(.error))' >/dev/null; then
+        st_prepare_readiness "$prepared" "$next" || { rc=$?; st_error readiness_proof_required 'Only verified null-to-identity readiness is permitted' "$rc"; return "$rc"; }
+    fi
+    st_lock || return $?
+    st_load || return $?
+    old=$ST_DOCUMENT
+    [ "$old" = "$prepared" ] || { st_conflict; return 3; }
+    if [ "$ST_SCAN_PROOF" = true ]; then st_freeze_scan || return $?; fi
+    if [ "${ST_SETTLED_PROVED:-false}" = true ] && printf '%s\n' "$next" | jq -e --argjson o "$old" '.nudge.settled_observed_at != $o.nudge.settled_observed_at' >/dev/null; then
+        next=$(printf '%s\n' "$next" | jq -c --arg at "$ST_SETTLED_AT" '.nudge.settled_observed_at=$at') || return 6
+    fi
+    if [ "$(printf '%s\n' "$old" | jq -r .revision)" != "$ST_EXPECT" ] || { [ -n "$ST_EXPECT_STATE" ] && [ "$(printf '%s\n' "$old" | jq -r '.state // ""')" != "$ST_EXPECT_STATE" ]; }; then st_conflict; return 3; fi
+    printf '%s\n' "$next" | jq -e --argjson o "$old" '.revision == $o.revision and .created_at == $o.created_at' >/dev/null || return 3
+    case "$ST_TYPE" in
+        status) st_cas_run "$old" "$next" || return $? ;;
+        *)
+            # Readiness, topology, closure, occupancy and incarnation changes require
+            # dedicated proof paths. Generic CAS cannot supply those proofs.
+            [ "$ST_READY_PROVED" = true ] || printf '%s\n' "$next" | jq -e --argjson o "$old" 'del(.revision,.updated_at,.error) == ($o | del(.revision,.updated_at,.error))' >/dev/null || { st_error invariant_violation 'Immutable record fields cannot change' 3; return 3; }
+            if [ "$ST_READY_PROVED" = true ] && [ "$ST_TYPE" = worker ]; then next=$(printf '%s\n' "$next" | jq -c --arg at "$(hd_now)" '.idle_since=$at'); fi ;;
+    esac
+    printf '%s\n' "$next" | jq --arg at "$(hd_now)" '.revision += 1 | .updated_at=$at' > "$HD_PRIVATE/next.json" || return 6
+    hd_remaining_ms >/dev/null || return 4
+    hd_atomic_replace "$ST_PATH" "$HD_PRIVATE/next.json" || { rc=$?; st_error io_error 'Cannot replace record' "$rc"; return "$rc"; }
+    ST_DOCUMENT=$(jq -c . "$HD_PRIVATE/next.json")
+    ST_RESULT=$(jq -cn --argjson document "$ST_DOCUMENT" --arg path "$ST_PATH" '{document:$document,path:$path,committed:true}')
+    ST_OUTCOME=ok
+    if ! st_unlock; then ST_OUTCOME=uncertain; st_error lock_release_failed 'Record committed; lock release failed' 5; return 5; fi
+}
+st_assign() {
+    local id=$1 name=$2 worker_revision=$3 status worker request live role at token attempt rc
+    ST_KEY=$id; st_path run "$id" || return 2; st_get || return $?
+    status=$ST_DOCUMENT
+    ST_OUTCOME=not-submitted; ST_RESULT='{}'
+    [ "$(printf '%s\n' "$status" | jq -r .revision)" = "$ST_EXPECT" ] || { st_conflict; return 3; }
+    ST_KEY=$name; st_path worker "$name" || return 2; st_load || return $?
+    worker=$ST_DOCUMENT
+    [ "$(printf '%s\n' "$worker" | jq -r .revision)" = "$worker_revision" ] || { st_conflict; return 3; }
+    st_live_scan || return $?
+    st_disk_scan || return $?
+    jq -e 'all(.[]; .status != null and .request != null)' "$HD_PRIVATE/runs.json" >/dev/null || { st_error quarantine 'Malformed runs prevent assignment' 3; return 3; }
+    [ ! -s "$HD_PRIVATE/issues.jsonl" ] || { st_error quarantine 'Inventory issues prevent assignment' 3; return 3; }
+    st_owned "$worker" || { st_error quarantine 'Worker ownership cannot be proved' 3; return 3; }
+    live=$(jq -c --arg n "$name" '.[] | select(.name == $n) | .live' "$HD_PRIVATE/workers.json")
+    printf '%s\n' "$live" | jq -e '. != null and (.agent_status | IN("idle","done"))' >/dev/null || { st_error quarantine 'Worker is not ready' 3; return 3; }
+    request=$(st_frontmatter "$HD_RUN_ROOT/$id/request.md") || return 3
+    role=$(jq -c --argjson w "$worker" 'select(.name == $w.role)' "$HD_PRIVATE/roles.jsonl")
+    printf '%s\n' "$worker" | jq -e --argjson r "$request" --argjson role "$role" --arg config "$HD_CONFIG_PATH" '
+        (.lifecycle | IN("ready","idle")) and .identity != null and .config_path == $config and .cwd == $r.cwd and
+        ($r.role == null or $r.role == .role) and $role.metadata != null and .kind == $role.effective_kind' >/dev/null || { st_error incompatible_worker 'Role, kind, cwd or readiness is incompatible' 3; return 3; }
+    [ "$(hd_directory "$(printf '%s\n' "$request" | jq -r .cwd)")" = "$(printf '%s\n' "$request" | jq -r .cwd)" ] || return 3
+    jq -e --argjson w "$worker" 'all(.[]; .status.worker_release.phase != "held" or (.status.assignment.worker_name != $w.name and .status.assignment.worker.pane_id != $w.pane_id and .status.assignment.worker.terminal_id != $w.identity.terminal_id))' "$HD_PRIVATE/runs.json" >/dev/null || { st_error conflict 'Worker already has a held assignment' 3; return 3; }
+    printf '%s\n' "$status" | jq -e '.state == "new" and .assignment == null and .worker_release.phase == "none"' >/dev/null || { st_error conflict 'Run is already assigned or terminal' 3; return 3; }
+    # Spawn must check the reuse TTL before returning this ready worker.
+    token=$(hd_random 16); attempt=$(hd_random 16); at=$(hd_now)
+    st_lock || return $?
+    st_freeze_scan || return $?
+    ST_KEY=$id; st_path run "$id" || return 2; st_load || return $?
+    [ "$ST_DOCUMENT" = "$status" ] || { st_conflict; return 3; }
+    printf '%s\n' "$status" | jq --argjson w "$worker" --arg token "$token" --arg attempt "$attempt" --arg at "$at" '
+        .revision += 1 | .updated_at=$at | .state="dispatched" |
+        .assignment={assignment_id:$token,worker_name:$w.name,role:$w.role,kind:$w.kind,cwd:$w.cwd,worker:$w.identity,assigned_at:$at} |
+        .worker_release={phase:"held",observed_at:null,reason:null} |
+        .delivery={phase:"sending",attempt_id:$attempt,started_at:$at,acknowledged_at:null,error:null}' > "$HD_PRIVATE/assigned.json" || return 6
+    hd_remaining_ms >/dev/null || return 4
+    hd_atomic_replace "$ST_PATH" "$HD_PRIVATE/assigned.json" || return $?
+    status=$(jq -c . "$HD_PRIVATE/assigned.json")
+    ST_RESULT=$(jq -cn --argjson s "$status" --argjson w "$worker" '{status:$s,worker:$w,committed:true}')
+    printf '%s\n' "$worker" | jq --arg id "$id" --arg at "$at" '.revision += 1 | .updated_at=$at | .lifecycle="occupied" | .active_run_id=$id | .idle_since=null' > "$HD_PRIVATE/occupied.json" || { ST_OUTCOME=uncertain; return 5; }
+    if ! hd_atomic_replace "$HD_RUN_ROOT/.workers/$name" "$HD_PRIVATE/occupied.json"; then ST_OUTCOME=uncertain; st_error partial_commit 'Assignment committed; cache update failed' 5; return 5; fi
+    ST_RESULT=$(jq -cn --argjson s "$status" --slurpfile w "$HD_PRIVATE/occupied.json" '{status:$s,worker:$w[0],committed:true}')
+    ST_OUTCOME=ok
+    if ! st_unlock; then ST_OUTCOME=uncertain; st_error partial_commit 'Assignment committed; lock release failed' 5; return 5; fi
+}
+st_notice() {
+    local id=$1 type=$2 path=$3 requester current record rc
+    ST_KEY=$id; st_path run "$id" || return 2
+    case "$type" in RESULT) [ "$path" = "$HD_RUN_ROOT/$id/result.md" ] || return 2 ;; FAILED) [ "$path" = "$ST_PATH" ] || return 2 ;; *) return 2 ;; esac
+    st_get || return $?
+    requester=$(st_frontmatter "$HD_RUN_ROOT/$id/request.md" | jq -c .requester) || return 3
+    current=$(hd_current_identity) || { rc=$?; st_error identity_unavailable 'Cannot verify current requester' "$rc"; return "$rc"; }
+    printf '%s\n' "$requester" | jq -e --argjson current "$current" '. == $current' >/dev/null || { st_error identity_mismatch 'Current occupant is not the saved requester' 3; return 3; }
+    shopt -s nullglob dotglob
+    for record in "$HD_RUN_ROOT/.dispatcher.json" "$HD_RUN_ROOT/.workers/"* "$HD_RUN_ROOT/.launches/"*; do
+        [ -e "$record" ] || [ -L "$record" ] || continue
+        case "$record" in */.dispatcher.json) ST_TYPE=dispatcher ;; */.workers/*) ST_TYPE=worker ;; *) ST_TYPE=launch ;; esac
+        hd_safe_file "$record" && hd_json_validate "$ST_TYPE" "$record" || { st_error malformed_record 'Cannot exclude managed requester' 3; return 3; }
+        if jq -e --argjson i "$current" '.pane_id == $i.pane_id or .identity.terminal_id == $i.terminal_id' "$record" >/dev/null; then st_error managed_requester 'Managed participants cannot consume notices' 3; return 3; fi
+    done
+    shopt -u nullglob dotglob
+    case "$type" in
+        RESULT) printf '%s\n' "$ST_DOCUMENT" | jq -e '.state == "done" or .state == "relayed"' >/dev/null && st_report "$id" "$ST_DOCUMENT" || return 3 ;;
+        FAILED) printf '%s\n' "$ST_DOCUMENT" | jq -e '.state == "failed" and .error != null' >/dev/null || return 3 ;;
+    esac
+    ST_RESULT=$(jq -cn --arg id "$id" --arg type "$type" --arg path "$path" --argjson requester "$requester" --argjson status "$ST_DOCUMENT" '{run_id:$id,type:$type,path:$path,requester:$requester,status_revision:$status.revision}')
+    ST_OUTCOME=ok
+}
+st_sync() {
+    local name=$1 worker old rows row id status updated live held phase observed lifecycle active idle rc committed=false gone=false
+    ST_KEY=$name; st_path worker "$name" || return 2; st_load || return $?
+    old=$ST_DOCUMENT
+    printf '%s\n' "$old" | jq -e '.lifecycle | IN("starting","closing","closed")' >/dev/null && { st_error unimplemented 'Readiness and closure reconciliation require their dedicated proof paths' 3; return 3; }
+    [ "$(printf '%s\n' "$old" | jq -r .revision)" = "$ST_EXPECT" ] || { st_conflict; return 3; }
+    st_live_scan || return $?
+    st_disk_scan || return $?
+    worker=$(jq -c --arg n "$name" '.[] | select(.name == $n)' "$HD_PRIVATE/workers.json")
+    # Any malformed published status makes a complete occupancy proof impossible.
+    jq -e 'all(.[]; .status != null and .request != null and .classification != "quarantined")' "$HD_PRIVATE/runs.json" >/dev/null || { st_error quarantine 'Malformed runs prevent occupancy reconciliation' 3; return 3; }
+    st_owned "$old" || { st_error quarantine 'Worker ownership cannot be proved' 3; return 3; }
+    live=$(printf '%s\n' "$worker" | jq -c .live)
+    if [ "$live" = null ]; then
+        st_gone_proof "$(printf '%s\n' "$old" | jq -c .identity)" || return $?
+        gone=true
+    else
+        printf '%s\n' "$live" | jq -e '.agent_status | IN("idle","done","working")' >/dev/null || { st_error quarantine 'Blocked or unknown occupant retains occupancy' 3; return 3; }
+        [ "$(printf '%s\n' "$old" | jq -r .lifecycle)" != gone ] || { st_error quarantine 'Retired occupant cannot be reused' 3; return 3; }
+    fi
+    rows=$(jq -c --arg n "$name" --argjson w "$old" '[.[] | select(.status.assignment != null and (.status.assignment.worker_name == $n or .status.assignment.worker.pane_id == $w.pane_id or .status.assignment.worker.terminal_id == $w.identity.terminal_id))]' "$HD_PRIVATE/runs.json")
+    printf '%s\n' "$rows" | jq -e --argjson w "$old" 'all(.[]; .status.assignment.worker_name == $w.name and .status.assignment.worker == $w.identity)' >/dev/null || { st_error quarantine 'Conflicting assignment occupant' 3; return 3; }
+    held=$(printf '%s\n' "$rows" | jq '[.[] | select(.status.worker_release.phase == "held")] | length')
+    [ "$held" -le 1 ] || { st_error quarantine 'Duplicate held assignments' 3; return 3; }
+    st_lock || return $?
+    st_load || return $?
+    [ "$ST_DOCUMENT" = "$old" ] || { st_conflict; return 3; }
+    st_freeze_scan || return $?
+    st_owned "$old" || { st_error quarantine 'Ownership changed during scan' 3; return 3; }
+    while IFS= read -r row; do
+        id=$(printf '%s\n' "$row" | jq -r .path)
+        status=$(printf '%s\n' "$row" | jq -c .document)
+        hd_safe_file "$id" && [ "$(jq -c . "$id")" = "$status" ] || { st_error conflict 'Scanned record changed' 3; return 3; }
+    done < "$HD_PRIVATE/snapshots.jsonl"
+    shopt -s nullglob dotglob
+    for row in "$HD_RUN_ROOT/.workers/"* "$HD_RUN_ROOT/.launches/"* "$HD_RUN_ROOT/.workspace.json" "$HD_RUN_ROOT/.dispatcher.json"; do
+        [ -e "$row" ] || [ -L "$row" ] || continue
+        jq -se --arg path "$row" 'any(.[]; .path == $path)' "$HD_PRIVATE/snapshots.jsonl" >/dev/null || { st_error conflict 'Record inventory changed' 3; return 3; }
+    done
+    shopt -u nullglob dotglob
+    # Recheck every scanned status, not only this worker's rows.
+    while IFS= read -r row; do
+        id=$(printf '%s\n' "$row" | jq -r .run_id)
+        status=$(printf '%s\n' "$row" | jq -c .status)
+        hd_safe_file "$HD_RUN_ROOT/$id/status" && [ "$(jq -c . "$HD_RUN_ROOT/$id/status")" = "$status" ] || { st_error conflict 'Scanned status changed' 3; return 3; }
+    done < <(jq -c '.[]' "$HD_PRIVATE/runs.json")
+    # Detect new publications since the scan while all publishers hold the same lock.
+    for row in "$HD_RUN_ROOT/"*; do
+        [ -e "$row" ] || continue
+        id=$(basename "$row"); case "$id" in .*) continue ;; esac
+        jq -e --arg id "$id" 'any(.[]; .run_id == $id)' "$HD_PRIVATE/runs.json" >/dev/null || { st_error conflict 'Run inventory changed' 3; return 3; }
+    done
+    idle=$(printf '%s\n' "$old" | jq -r '.idle_since // empty'); active=null
+    if [ "$gone" = true ]; then lifecycle=gone; idle=''; else
+        lifecycle=$(printf '%s\n' "$live" | jq -r 'if .agent_status == "idle" or .agent_status == "done" then "idle" else "quarantined" end')
+    fi
+    while IFS= read -r row; do
+        id=$(printf '%s\n' "$row" | jq -r .run_id); status=$(printf '%s\n' "$row" | jq -c .status)
+        phase=$(printf '%s\n' "$status" | jq -r .worker_release.phase)
+        if [ "$phase" = held ]; then
+            active=$(jq -cn --arg id "$id" '$id'); lifecycle=occupied; idle=''
+            if [ "$gone" = true ]; then
+                observed=$(hd_now)
+                printf '%s\n' "$status" | jq --arg at "$observed" '.worker_release={phase:"retired",observed_at:$at,reason:"worker_gone"} | .revision += 1 | .updated_at=$at' > "$HD_PRIVATE/released.json" || return 6
+                hd_atomic_replace "$HD_RUN_ROOT/$id/status" "$HD_PRIVATE/released.json" || return 6
+                committed=true; ST_OUTCOME=uncertain
+                ST_RESULT=$(jq -cn --argjson w "$old" '{worker:$w,committed:true}')
+                active=null; lifecycle=gone; idle=''
+            elif printf '%s\n' "$status" | jq -e '.state == "done" or .state == "relayed"' >/dev/null && printf '%s\n' "$live" | jq -e '.agent_status == "idle" or .agent_status == "done"' >/dev/null && st_report "$id" "$status"; then
+                observed=$(hd_now)
+                printf '%s\n' "$status" | jq --arg at "$observed" '.worker_release={phase:"released",observed_at:$at,reason:"valid_result_settled"} | .revision += 1 | .updated_at=$at' > "$HD_PRIVATE/released.json" || return 6
+                hd_atomic_replace "$HD_RUN_ROOT/$id/status" "$HD_PRIVATE/released.json" || return 6
+                committed=true; ST_OUTCOME=uncertain
+                ST_RESULT=$(jq -cn --argjson w "$old" '{worker:$w,committed:true}')
+                idle=$observed; active=null; lifecycle=idle
+            fi
+        fi
+    done < <(printf '%s\n' "$rows" | jq -c 'sort_by(.status.assignment.assigned_at,.run_id)[]')
+    if [ "$active" = null ] && [ "$committed" = false ] && [ "$gone" = false ]; then
+        observed=$(printf '%s\n' "$rows" | jq -r '[.[] | select(.status.worker_release.phase == "released")] | sort_by(.status.assignment.assigned_at,.run_id) | last | .status.worker_release.observed_at // empty')
+        [ -z "$observed" ] || idle=$observed
+    fi
+    if [ "$gone" = true ]; then idle=''; fi
+    [ -n "$idle" ] || [ "$lifecycle" != idle ] || idle=$(hd_now)
+    printf '%s\n' "$old" | jq --arg at "$(hd_now)" --arg lifecycle "$lifecycle" --argjson active "$active" --arg idle "$idle" '.revision += 1 | .updated_at=$at | .lifecycle=$lifecycle | .active_run_id=$active | .idle_since=(if $idle == "" then null else $idle end)' > "$HD_PRIVATE/synced.json" || return 6
+    if ! hd_atomic_replace "$ST_PATH" "$HD_PRIVATE/synced.json"; then
+        ST_RESULT=$(jq -cn --argjson w "$old" --argjson committed "$committed" '{worker:$w,committed:$committed}')
+        if [ "$committed" = true ]; then ST_OUTCOME=uncertain; st_error partial_commit 'Release committed; worker cache update failed' 5; return 5; fi
+        st_error io_error 'Worker update failed' 6; return 6
+    fi
+    ST_RESULT=$(jq -cn --slurpfile w "$HD_PRIVATE/synced.json" '{worker:$w[0],committed:true}')
+    ST_OUTCOME=ok
+    if ! st_unlock; then ST_OUTCOME=uncertain; st_error partial_commit 'Worker committed; lock release failed' 5; return 5; fi
+}
+
+main() {
+    local command='' arg options=1 positions=() seen='' expected_worker='' expected_session='' worker=''
+    hd_deadline_start 30000 || return $?
+    if [ "$#" -eq 1 ] && [ "$1" = --help ]; then
+        printf 'Usage: bin/run-state get TYPE KEY | cas TYPE KEY --expect-revision N|absent --document FILE [--expect-state STATE]\n       bin/run-state worker-sync NAME --expect-revision N\n       bin/run-state check-notice RUN_ID RESULT|FAILED ABS_PATH\n       bin/run-state assign RUN_ID --worker NAME --expect-revision N --expect-worker-revision N\n       bin/run-state retire-worker NAME --expect-revision N --expected-session JSON\n       bin/run-state register-dispatcher --expect-revision N|absent --expected-session JSON\nAll commands accept --timeout-ms N. Retirement and registration retain uncertain mutations for inspection.\n'
+        return 0
+    fi
+    ST_EXPECT=''; ST_EXPECT_STATE=''; ST_FILE=''; ST_TIMEOUT=''
+    while [ "$#" -gt 0 ]; do
+        arg=$1; shift
+        if [ "$options" -eq 1 ]; then
+            case "$arg" in
+                --) options=0; continue ;;
+                --expect-revision|--expect-state|--document|--timeout-ms|--worker|--expect-worker-revision|--expected-session)
+                    [ "$#" -gt 0 ] && [ -n "$1" ] || return 2
+                    case " $seen " in *" $arg "*) return 2 ;; esac
+                    seen="$seen $arg"
+                    case "$arg" in
+                        --expect-revision) ST_EXPECT=$1 ;; --expect-state) ST_EXPECT_STATE=$1 ;; --document) ST_FILE=$1 ;; --timeout-ms) ST_TIMEOUT=$1 ;;
+                        --worker) worker=$1 ;; --expect-worker-revision) expected_worker=$1 ;; --expected-session) expected_session=$1 ;;
+                    esac
+                    shift; continue ;;
+                --*) return 2 ;;
+            esac
+        fi
+        positions[${#positions[@]}]=$arg
+    done
+    [ "${#positions[@]}" -gt 0 ] || return 2
+    command=${positions[0]}
+    if [ -n "$ST_EXPECT" ] && [ "$ST_EXPECT" != absent ]; then [[ "$ST_EXPECT" =~ ^(0|[1-9][0-9]*)$ ]] || return 2; fi
+    if [ -n "$expected_worker" ]; then [[ "$expected_worker" =~ ^(0|[1-9][0-9]*)$ ]] || return 2; fi
+    # Reject irrelevant options as well as duplicates.
+    case "$command" in
+        get) [ "${#positions[@]}" -eq 3 ] && [ -z "$ST_EXPECT$ST_EXPECT_STATE$ST_FILE$worker$expected_worker$expected_session" ] || return 2 ;;
+        cas) [ "${#positions[@]}" -eq 3 ] && [ -n "$ST_EXPECT" ] && [ -n "$ST_FILE" ] && [ -z "$worker$expected_worker$expected_session" ] || return 2 ;;
+        worker-sync) [ "${#positions[@]}" -eq 2 ] && [ -n "$ST_EXPECT" ] && [ "$ST_EXPECT" != absent ] && [ -z "$ST_EXPECT_STATE$ST_FILE$worker$expected_worker$expected_session" ] || return 2 ;;
+        check-notice) [ "${#positions[@]}" -eq 4 ] && [ -z "$ST_EXPECT$ST_EXPECT_STATE$ST_FILE$worker$expected_worker$expected_session" ] || return 2 ;;
+        assign) [ "${#positions[@]}" -eq 2 ] && [ -n "$ST_EXPECT" ] && [ "$ST_EXPECT" != absent ] && [ -n "$worker" ] && [ -n "$expected_worker" ] && [ -z "$ST_EXPECT_STATE$ST_FILE$expected_session" ] || return 2 ;;
+        retire-worker) [ "${#positions[@]}" -eq 2 ] && [ -n "$ST_EXPECT" ] && [ "$ST_EXPECT" != absent ] && [ -n "$expected_session" ] && [ -z "$ST_EXPECT_STATE$ST_FILE$worker$expected_worker" ] || return 2 ;;
+        register-dispatcher) [ "${#positions[@]}" -eq 1 ] && [ -n "$ST_EXPECT" ] && [ -n "$expected_session" ] && [ -z "$ST_EXPECT_STATE$ST_FILE$worker$expected_worker" ] || return 2 ;;
+        *) return 2 ;;
+    esac
+    case "$command" in get|check-notice) ST_OUTCOME=error ;; esac
+    st_init || return $?
+    case "$command" in
+        get|cas)
+            ST_KEY=${positions[2]}; st_path "${positions[1]}" "$ST_KEY" || return 2
+            [ -z "$ST_EXPECT_STATE" ] || { [ "$ST_TYPE" = status ] && [[ "$ST_EXPECT_STATE" =~ ^(new|dispatched|done|relayed|failed)$ ]]; } || return 2
+            if [ "$command" = get ]; then ST_OUTCOME=error; st_get; else st_cas; fi ;;
+        check-notice) ST_OUTCOME=error; st_notice "${positions[1]}" "${positions[2]}" "${positions[3]}" ;;
+        worker-sync) st_sync "${positions[1]}" ;;
+        assign) st_assign "${positions[1]}" "$worker" "$expected_worker" ;;
+        retire-worker|register-dispatcher)
+            if [ -n "$expected_session" ]; then printf '%s\n' "$expected_session" > "$HD_PRIVATE/expected.json"; hd_occupant_validate "$HD_PRIVATE/expected.json" || return 2; fi
+            for arg in "$HD_RUN_ROOT" "$HD_RUN_ROOT/.locks" "$HD_RUN_ROOT/.workers" "$HD_RUN_ROOT/.launches"; do
+                hd_no_links "$arg" || return 2
+                if [ -e "$arg" ]; then [ -d "$arg" ] || return 2; else mkdir -- "$arg" || return 6; fi
+            done
+            if [ "$command" = retire-worker ]; then lc_retire "${positions[1]}" "$ST_EXPECT" "$expected_session"; else lc_register "$expected_session"; fi ;;
+    esac
+}
+rc=0
+main "$@" || rc=$?
+if [ "$rc" -ne 0 ] && [ "$ST_OUTCOME" = uncertain ]; then rc=5; fi
+if [ "$#" -eq 1 ] && [ "$1" = --help ] && [ "$rc" -eq 0 ]; then exit 0; fi
+st_finish "$rc"
+exit "$rc"

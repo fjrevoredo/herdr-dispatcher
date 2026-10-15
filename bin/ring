@@ -1,0 +1,195 @@
+#!/bin/bash
+# Serialized, bounded application input. Never changes run status.
+# shellcheck disable=SC1091,SC2034
+source "$(cd "$(dirname "$0")" && pwd -P)/state-lib.sh"
+set -uo pipefail
+umask 077
+R_TARGET=''
+R_IDENTITY=null
+R_SUBMITTED=false
+R_STATUS=null
+R_EXPECTED=''
+R_MESSAGE=''
+R_CODE=failed_precondition
+R_ERROR='Ring precondition failed'
+R_MANUAL=false
+R_ENTRY_SECONDS=$SECONDS
+R_OWNERSHIP_PINNED=false
+R_OWNER_PATH=''
+R_OWNER_RECORD=''
+
+ring_fail() { R_CODE=$1; R_ERROR=$2; return "$3"; }
+ring_equal() { printf '%s\n' "$1" | jq -e --argjson other "$2" '. == $other' >/dev/null; }
+ring_snapshot() {
+    local identity
+    identity=$(hd_target_identity "$R_TARGET") || return $?
+    ring_equal "$identity" "$R_IDENTITY" || return 3
+    R_LIVE=$(hd_live_metadata "$R_TARGET") || return $?
+    printf '%s\n' "$R_LIVE" | jq -e --argjson i "$R_IDENTITY" '
+        .pane_id == $i.pane_id and .terminal_id == $i.terminal_id and
+        .agent == $i.kind and .agent_session == $i.agent_session' >/dev/null || return 3
+    R_STATUS=$(printf '%s\n' "$R_LIVE" | jq -c '.agent_status // null') || return 3
+}
+ring_record_live() {
+    printf '%s\n' "$R_LIVE" | jq -e --argjson r "$1" --argjson i "$R_IDENTITY" --arg config "$HD_CONFIG_PATH" '
+        $r.identity == $i and $r.config_path == $config and $r.pane_id == .pane_id and
+        $r.workspace_id == .workspace_id and $r.tab_id == .tab_id and
+        $r.kind == .agent and $r.cwd == .cwd and $r.name == .name and
+        ($r.lifecycle | IN("ready","idle","occupied","blocked"))' >/dev/null
+}
+ring_dispatcher_owned() {
+    local r=$1 launch mode workspace
+    mode=$(printf '%s\n' "$r" | jq -r .ownership.mode)
+    printf '%s\n' "$r" | jq -e --argjson config "$HD_CONFIG_JSON" '
+        .kind == $config.dispatcher_kind and .cwd == $config.repo_path' >/dev/null || return 3
+    [ "$mode" != registered ] || return 0
+    launch=$(printf '%s\n' "$r" | jq -r .ownership.launch_id)
+    hd_safe_file "$HD_RUN_ROOT/.launches/$launch.json" && hd_json_validate launch "$HD_RUN_ROOT/.launches/$launch.json" || return 3
+    jq -e --argjson r "$r" '
+        .target == "dispatcher" and .ownership_mode == "created" and .phase == "ready" and
+        .launch_id == $r.ownership.launch_id and .ownership_token == $r.ownership.token and
+        .name == $r.name and .kind == $r.kind and .cwd == $r.cwd and .config_path == $r.config_path and
+        .workspace_id == $r.workspace_id and .tab_id == $r.tab_id and .pane_id == $r.pane_id and .identity == $r.identity' "$HD_RUN_ROOT/.launches/$launch.json" >/dev/null || return 3
+    hd_safe_file "$HD_RUN_ROOT/.workspace.json" && hd_json_validate workspace "$HD_RUN_ROOT/.workspace.json" || return 3
+    workspace=$(jq -c . "$HD_RUN_ROOT/.workspace.json") || return 3
+    printf '%s\n' "$workspace" | jq -e --argjson r "$r" '.workspace_id == $r.workspace_id and .config_path == $r.config_path and .lifecycle == "ready"' >/dev/null || return 3
+    launch=$(printf '%s\n' "$workspace" | jq -r .launch_id)
+    hd_safe_file "$HD_RUN_ROOT/.launches/$launch.json" && hd_json_validate launch "$HD_RUN_ROOT/.launches/$launch.json" || return 3
+    jq -e --argjson w "$workspace" '.ownership_mode == "created" and .config_path == $w.config_path and .launch_id == $w.launch_id and .ownership_token == $w.ownership_token and .workspace_id == $w.workspace_id and .tab_id == $w.initial_tab_id and .pane_id == $w.initial_pane_id' "$HD_RUN_ROOT/.launches/$launch.json" >/dev/null || return 3
+}
+ring_ownership() {
+    local path record role kind signature owner_path='' owner_record='' found=false
+    R_REGISTERED_DISPATCHER=false
+    shopt -s nullglob
+    for path in "$HD_RUN_ROOT/.workers/"* "$HD_RUN_ROOT/.dispatcher.json"; do
+        [ -e "$path" ] || [ -L "$path" ] || continue
+        hd_safe_file "$path" || return 3
+        record=$(jq -c . "$path") || return 3
+        if ! printf '%s\n' "$record" | jq -e --arg pane "$R_TARGET" --arg name "$R_ALIAS" --argjson live "$R_LIVE" '.pane_id == $pane or .name == $name or .name == $live.name' >/dev/null; then continue; fi
+        [ "$found" = false ] || return 3
+        found=true
+        signature=$(printf '%s\n' "$record" | jq -c '{name,role,kind,cwd,config_path,ownership,workspace_id,tab_id,pane_id,identity,created_at}') || return 3
+        if [ "$R_OWNERSHIP_PINNED" = true ]; then
+            [ "$path" = "$R_OWNER_PATH" ] && ring_equal "$signature" "$R_OWNER_RECORD" || return 3
+        fi
+        owner_path=$path; owner_record=$signature
+        if [ "$path" = "$HD_RUN_ROOT/.dispatcher.json" ]; then
+            hd_json_validate dispatcher "$path" && ring_record_live "$record" && ring_dispatcher_owned "$record" || return 3
+            R_REGISTERED_DISPATCHER=true
+        else
+            hd_json_validate worker "$path" && ring_record_live "$record" && st_owned "$record" || return 3
+            role=$(printf '%s\n' "$record" | jq -r .role)
+            hd_safe_file "$HD_REPO_PATH/roles/$role.md" && hd_json_validate role "$HD_REPO_PATH/roles/$role.md" || return 3
+            kind=$(hd_frontmatter "$HD_REPO_PATH/roles/$role.md" | jq -r --arg role "$role" --argjson c "$HD_CONFIG_JSON" '$c.worker_kinds[$role] // .kind') || return 3
+            printf '%s\n' "$record" | jq -e --arg kind "$kind" --arg role "$role" '.kind == $kind and .role == $role' >/dev/null || return 3
+        fi
+    done
+    if [ "$R_OWNERSHIP_PINNED" = true ]; then
+        [ "$owner_path" = "$R_OWNER_PATH" ] || return 3
+    else
+        R_OWNER_PATH=$owner_path; R_OWNER_RECORD=$owner_record
+        R_OWNERSHIP_PINNED=true
+    fi
+    if [ "$R_MANUAL" = true ] || [ "$R_ALIAS" = dispatcher ]; then
+        if [ "${R_REGISTERED_DISPATCHER:-false}" != true ]; then
+            [ "$R_MANUAL" != true ] || return 2
+            return 3
+        fi
+    fi
+}
+ring_main() {
+    local timeout='' caller pane terminal remaining rc key ack identity arg options=true seen_expected=false seen_timeout=false positions=()
+    while [ "$#" -gt 0 ]; do
+        arg=$1; shift
+        if [ "$options" = true ]; then
+            case "$arg" in
+                --) options=false; continue ;;
+                --expected-session) [ "$#" -ge 1 ] && [ "$seen_expected" = false ] || return 2; R_EXPECTED=$1; seen_expected=true; shift; [ -n "$R_EXPECTED" ] || return 2; continue ;;
+                --timeout-ms) [ "$#" -ge 1 ] && [ "$seen_timeout" = false ] || return 2; timeout=$1; seen_timeout=true; shift; [ -n "$timeout" ] || return 2; continue ;;
+                -*) return 2 ;;
+            esac
+        fi
+        positions[${#positions[@]}]=$arg
+    done
+    [ "${#positions[@]}" -eq 2 ] || ring_fail invalid_arguments 'Target and literal message are required' 2 || return $?
+    R_ALIAS=${positions[0]}; R_MESSAGE=${positions[1]}
+    [ -n "$R_ALIAS" ] && [ -n "$R_MESSAGE" ] || return 2
+    hd_deadline_start "${timeout:-30000}" || return 2
+    HD_STARTED_SECONDS=$R_ENTRY_SECONDS
+    hd_config_load || return $?
+    if [ -z "$timeout" ]; then HD_BUDGET_MS=$(printf '%s\n' "$HD_CONFIG_JSON" | jq -r .ring_timeout_ms); fi
+    if [ -n "$R_EXPECTED" ]; then
+        printf '%s\n' "$R_EXPECTED" > "$HD_PRIVATE/expected.json"
+        hd_occupant_validate "$HD_PRIVATE/expected.json" || return 2
+    elif [ "$R_MESSAGE" = RECONCILE ]; then R_MANUAL=true
+    else ring_fail expected_session_required 'Expected occupant is required' 2; return $?; fi
+    hd_cli_read pane current --current || return $?
+    caller=$(jq -ce '.result | select(.type == "pane_current") | .pane | select((.pane_id | type == "string" and length > 0) and (.terminal_id | type == "string" and length > 0))' "$HD_CHILD_STDOUT") || return 3
+    identity=$(hd_target_identity "$R_ALIAS") || return $?
+    R_IDENTITY=$identity
+    R_TARGET=$(printf '%s\n' "$R_IDENTITY" | jq -r .pane_id)
+    pane=$(printf '%s\n' "$caller" | jq -r .pane_id)
+    terminal=$(printf '%s\n' "$caller" | jq -r .terminal_id)
+    if printf '%s\n' "$R_IDENTITY" | jq -e --arg pane "$pane" --arg terminal "$terminal" '.pane_id == $pane or .terminal_id == $terminal' >/dev/null; then
+        ring_fail self_target 'Cannot ring the caller pane' 3; return $?
+    fi
+    [ -z "$R_EXPECTED" ] || ring_equal "$R_IDENTITY" "$R_EXPECTED" || return 3
+    R_LIVE=$(hd_live_metadata "$R_TARGET") || return $?
+    ring_ownership || return $?
+    # Encode every opaque pane byte. Names and pane aliases use the same key.
+    key=$(printf '%s' "$R_TARGET" | od -An -tx1 | tr -d ' \n')
+    hd_no_links "$HD_RUN_ROOT/.locks" || return 3
+    mkdir -p "$HD_RUN_ROOT/.locks" || return 6
+    hd_lock_acquire "$HD_RUN_ROOT/.locks/pane-$key" || return $?
+    while :; do
+        ring_snapshot && ring_ownership || return $?
+        case "$R_STATUS" in
+            '"idle"'|'"done"') break ;;
+            '"working"') hd_sleep || return 4 ;;
+            *) ring_fail target_not_ready 'Target is not idle or done' 3; return $? ;;
+        esac
+    done
+    # Ownership was checked in the loop. Make the last operation a live
+    # process/occupant and readiness proof, not another disk scan.
+    ring_snapshot && ring_ownership && ring_snapshot || return $?
+    case "$R_STATUS" in '"idle"'|'"done"') ;; *) return 3 ;; esac
+    remaining=$(hd_remaining_ms) || return 4
+    rc=0
+    hd_child_call write -- herdr agent prompt "$R_TARGET" "$R_MESSAGE" --wait --until working --timeout "$remaining" || rc=$?
+    # Expiry before the child starts is proven zero input.
+    [ "$rc" -ne 4 ] || return 4
+    R_SUBMITTED=null
+    if [ "$rc" -ne 0 ]; then
+        if [ "$HD_CHILD_UNCERTAIN" = false ] && [ "$HD_CHILD_EXIT" = 1 ] && jq -se 'length == 1 and (.[0].error.code | IN("agent_blocked","pane_not_found","agent_not_found"))' "$HD_CHILD_STDERR" >/dev/null 2>&1; then
+            R_SUBMITTED=false; ring_fail input_rejected 'CLI rejected input before submission' 3; return $?
+        fi
+        ring_fail delivery_uncertain 'Input may have been submitted; do not resend blindly' 5; return $?
+    fi
+    ack=$(jq -sce 'select(length == 1) | .[0] | select(.error == null and .result.type == "agent_prompted") | .result.agent | select(.agent_status == "working")' "$HD_CHILD_STDOUT") || { ring_fail invalid_acknowledgement 'No valid working acknowledgement' 5; return $?; }
+    printf '%s\n' "$ack" | jq -e --argjson i "$R_IDENTITY" '.pane_id == $i.pane_id and .terminal_id == $i.terminal_id and .agent == $i.kind and .agent_session == $i.agent_session' >/dev/null || return 5
+    identity=$(hd_target_identity "$R_TARGET") || return 5
+    ring_equal "$identity" "$R_IDENTITY" || return 5
+    ring_ownership || return 5
+    R_SUBMITTED=true; R_STATUS='"working"'
+}
+if [ "$#" -eq 1 ] && [ "$1" = --help ]; then
+    printf '%s\n' 'Usage: bin/ring TARGET MESSAGE [--expected-session JSON] [--timeout-ms N]'
+    exit 0
+fi
+rc=0
+ring_main "$@" || rc=$?
+result=$(jq -cn --arg target "$R_TARGET" --argjson identity "$R_IDENTITY" --argjson submitted "$R_SUBMITTED" --argjson status "$R_STATUS" '{target:(if $target == "" then null else $target end),identity:$identity,submitted:$submitted,observed_status:$status}')
+if [ "$rc" -eq 0 ]; then hd_emit input-accepted "$result" null
+else
+    case "$rc" in
+        2) R_CODE=invalid_arguments; R_ERROR='Invalid ring arguments' ;;
+        4) R_CODE=budget_expired; R_ERROR='Ring budget expired' ;;
+        5) R_CODE=delivery_uncertain; R_ERROR='Input may have been submitted; do not resend blindly' ;;
+        6) R_CODE=live_query_failed; R_ERROR='CLI query failed before input' ;;
+    esac
+    outcome=not-submitted; [ "$rc" -ne 5 ] || outcome=uncertain
+    error=$(jq -cn --arg code "$R_CODE" --arg message "$R_ERROR" --argjson retryable "$([ "$rc" -eq 4 ] && printf true || printf false)" '{code:$code,message:$message,retryable:$retryable}')
+    hd_emit "$outcome" "$result" "$error"
+    printf 'ring: %s\n' "$R_CODE" >&2
+fi
+exit "$rc"

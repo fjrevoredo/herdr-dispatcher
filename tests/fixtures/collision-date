@@ -1,0 +1,7 @@
+#!/bin/bash
+set -eu
+if [ "$#" -eq 2 ] && [ "$1" = -u ] && [ "$2" = '+%Y%m%dT%H%M%SZ' ]; then
+    printf '%s\n' "${TEST_COLLISION_ID%%-*}"
+else
+    /bin/date "$@"
+fi

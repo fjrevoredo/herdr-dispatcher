@@ -1,0 +1,74 @@
+#!/bin/bash
+# Launch an owned agent. Never submit a task or close an unrelated pane.
+# shellcheck disable=SC1091,SC2034,SC2015
+source "$(cd "$(dirname "$0")" && pwd -P)/spawn-lib.sh"
+umask 077
+main() {
+    local arg options=1 positions=() seen='' timeout='' started role path rc
+    hd_deadline_start 30000 || return $?
+    started=$HD_STARTED_SECONDS
+    if [ "$#" -eq 1 ] && [ "$1" = --help ]; then
+        printf 'Usage: bin/spawn dispatcher [--timeout-ms N]\n       bin/spawn worker --role NAME --cwd ABS_DIR [--timeout-ms N]\nLaunch only. Recover proven partial registrations. Preserve uncertain mutations for human inspection.\n'
+        return 0
+    fi
+    while [ "$#" -gt 0 ]; do
+        arg=$1; shift
+        if [ "$options" -eq 1 ]; then
+            case "$arg" in
+                --) options=0; continue ;;
+                --role|--cwd|--timeout-ms)
+                    [ "$#" -gt 0 ] && [ -n "$1" ] || return 2
+                    case " $seen " in *" $arg "*) return 2 ;; esac
+                    seen="$seen $arg"
+                    case "$arg" in --role) SP_ROLE=$1 ;; --cwd) SP_CWD=$1 ;; --timeout-ms) timeout=$1 ;; esac
+                    shift; continue ;;
+                -*) return 2 ;;
+            esac
+        fi
+        positions[${#positions[@]}]=$arg
+    done
+    [ "${#positions[@]}" -eq 1 ] || return 2
+    SP_TARGET=${positions[0]}
+    case "$SP_TARGET" in
+        dispatcher) [ -z "$SP_ROLE$SP_CWD" ] || return 2 ;;
+        worker) [ -n "$SP_ROLE" ] && [ -n "$SP_CWD" ] || return 2
+            printf '%s\n' "$SP_ROLE" | jq -Re 'test("^[a-z][a-z0-9_-]{0,23}$")' >/dev/null || return 2
+            case "$SP_CWD" in /*) ;; *) return 2 ;; esac ;;
+        *) return 2 ;;
+    esac
+    hd_config_load || { st_error invalid_config 'Cannot load valid active config' 2; return 2; }
+    hd_deadline_start "${timeout:-$(printf '%s\n' "$HD_CONFIG_JSON" | jq -r .startup_timeout_ms)}" || return 2
+    HD_STARTED_SECONDS=$started
+    export HERDR_DISPATCHER_CONFIG="$HD_CONFIG_PATH"
+    if [ "$SP_TARGET" = dispatcher ]; then
+        SP_CWD=$HD_REPO_PATH; SP_KIND=$(printf '%s\n' "$HD_CONFIG_JSON" | jq -r .dispatcher_kind)
+    else
+        SP_CWD=$(hd_directory "$SP_CWD") || return 2
+        path="$HD_REPO_PATH/roles/$SP_ROLE.md"
+        hd_safe_file "$path" && hd_json_validate role "$path" || { st_error invalid_role 'Role is missing or invalid' 2; return 2; }
+        role=$(st_frontmatter "$path") || return 2
+        printf '%s\n' "$role" | jq -e --arg name "$SP_ROLE" '.name == $name' >/dev/null || return 2
+        SP_KIND=$(printf '%s\n' "$role" | jq -r --argjson c "$HD_CONFIG_JSON" '$c.worker_kinds[.name] // .kind')
+        SP_TTL=$(printf '%s\n' "$role" | jq -r --argjson c "$HD_CONFIG_JSON" '.idle_ttl_seconds // $c.idle_ttl_seconds')
+        SP_LIMIT=$(printf '%s\n' "$role" | jq -r .max_instances)
+    fi
+    for path in "$HD_RUN_ROOT" "$HD_RUN_ROOT/.locks" "$HD_RUN_ROOT/.workers" "$HD_RUN_ROOT/.launches"; do
+        hd_no_links "$path" || return 2
+        if [ -e "$path" ]; then [ -d "$path" ] || return 2; else mkdir -- "$path" || return 6; fi
+    done
+    hd_lock_acquire "$HD_RUN_ROOT/.locks/startup" || { rc=$?; st_error startup_lock_unavailable 'Cannot take startup lock' "$rc"; return "$rc"; }
+    sp_plan
+}
+rc=0
+main "$@" || rc=$?
+if [ "$#" -eq 1 ] && [ "$1" = --help ] && [ "$rc" -eq 0 ]; then exit 0; fi
+# A failed post-mutation file update must not hide a retained reservation.
+if [ "$rc" -ne 0 ] && [ -n "${SP_RESERVED_PATH:-}" ] && hd_safe_file "$SP_RESERVED_PATH" && hd_json_validate launch "$SP_RESERVED_PATH"; then
+    SP_LAUNCH=$(jq -c . "$SP_RESERVED_PATH")
+    SP_RETAINED=true
+    if [ "${SP_MUTATION_ATTEMPTED:-false}" = true ] && [ "$(printf '%s\n' "$SP_LAUNCH" | jq -r .phase)" != blocked ]; then rc=5; fi
+fi
+if [ "$rc" -eq 5 ]; then ST_OUTCOME=uncertain; fi
+sp_result "$([ "$rc" -eq 0 ] && printf false || printf true)"
+st_finish "$rc"
+exit "$rc"

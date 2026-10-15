@@ -1,0 +1,45 @@
+#!/bin/bash
+# Read-only inventory. Saved records never adopt a live agent by name.
+# shellcheck disable=SC1091,SC2034
+source "$(cd "$(dirname "$0")" && pwd -P)/state-lib.sh"
+ST_OUTCOME=error
+main() {
+    local seen=0 arg dispatcher_owned=false
+    hd_deadline_start 30000 || return $?
+    if [ "$#" -eq 1 ] && [ "$1" = --help ]; then
+        printf 'Usage: bin/registry [--timeout-ms N]\n'
+        return 0
+    fi
+    while [ "$#" -gt 0 ]; do
+        arg=$1; shift
+        case "$arg" in
+            --timeout-ms) [ "$seen" -eq 0 ] && [ "$#" -gt 0 ] && [ -n "$1" ] || return 2; ST_TIMEOUT=$1; seen=1; shift ;;
+            --) [ "$#" -eq 0 ] || return 2 ;;
+            *) return 2 ;;
+        esac
+    done
+    st_init || return $?
+    st_live_scan || return $?
+    st_disk_scan || return $?
+    if [ "$ST_DISPATCHER" != null ]; then
+        if jq -se --argjson d "$ST_DISPATCHER" --argjson c "$HD_CONFIG_JSON" --arg config "$HD_CONFIG_PATH" --argjson w "$ST_WORKSPACE" '
+            $d.identity != null and $d.config_path == $config and $d.cwd == $c.repo_path and $d.kind == $c.dispatcher_kind and
+            any(.[]; .target == "dispatcher" and .ownership_token == $d.ownership.token and .ownership_mode == $d.ownership.mode and .identity == $d.identity and .workspace_id == $d.workspace_id and .tab_id == $d.tab_id and .pane_id == $d.pane_id and .config_path == $config and .cwd == $d.cwd and .kind == $d.kind and
+                (if $d.ownership.mode == "created" then .launch_id == $d.ownership.launch_id and $w.workspace_id == $d.workspace_id and $w.config_path == $config else true end))' "$HD_PRIVATE/launches.jsonl" >/dev/null; then dispatcher_owned=true
+        else st_issue "$HD_RUN_ROOT/.dispatcher.json" ownership_conflict 'Dispatcher ownership is missing or conflicting'; fi
+    fi
+    ST_RESULT=$(jq -cn --arg config "$HD_CONFIG_PATH" --argjson workspace "$ST_WORKSPACE" --argjson dispatcher "$ST_DISPATCHER" --argjson dispatcher_owned "$dispatcher_owned" \
+        --slurpfile roles "$HD_PRIVATE/roles.jsonl" --slurpfile runs "$HD_PRIVATE/runs.jsonl" \
+        --slurpfile workers "$HD_PRIVATE/workers.jsonl" --slurpfile launches "$HD_PRIVATE/launches.jsonl" \
+        --slurpfile issues "$HD_PRIVATE/issues.jsonl" --slurpfile live "$HD_PRIVATE/live.jsonl" '
+        {config_path:$config,roles:$roles,runs:$runs,workers:$workers,workspace:$workspace,dispatcher:$dispatcher,launches:$launches,
+         unrelated_agents:[$live[] | . as $l |
+             select(([$workers[] | select(.classification != "quarantined" and .live != null and .live.identity == $l.identity)] | length) == 0) |
+             select(($dispatcher_owned | not) or $dispatcher.identity != $l.identity)],issues:$issues}') || return 6
+    ST_OUTCOME=ok
+}
+rc=0
+main "$@" || rc=$?
+if [ "$#" -eq 1 ] && [ "$1" = --help ] && [ "$rc" -eq 0 ]; then exit 0; fi
+st_finish "$rc"
+exit "$rc"

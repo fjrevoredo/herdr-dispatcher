@@ -673,7 +673,10 @@ frontmatter, status is §6, result_path is null if absent. Classification is `qu
 `{identity, name, workspace_id, tab_id, cwd, agent_status, state_change_seq}`. Worker classification
 is `ready`, `occupied`, `idle`, `starting`, `blocked`, `stale`, `closed`, or `quarantined`.
 Live summary name is null when unnamed; state_change_seq is an integer when provided and null
-otherwise. workspace/dispatcher are null or their record. Launches are journal documents. unrelated_agents
+otherwise. When a successful inventory lists an occupant without a valid supported identity,
+retain its live summary with identity null and a live_identity_unavailable issue. Quarantine any
+matching managed record; missing identity is never absence or free-capacity proof. Query failures
+still fail the scan. Such summaries remain unrelated unless ownership can be proved. workspace/dispatcher are null or their record. Launches are journal documents. unrelated_agents
 are live summaries of the same shape. Issues entries are `{path, code, message, run_id,
 worker_name}` with nullable IDs. Malformed entries have null parsed documents, classification
 quarantined, and issues; do not omit them. A healthy scan with issues is exit 0; a failed live

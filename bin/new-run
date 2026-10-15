@@ -1,0 +1,165 @@
+#!/bin/bash
+# Publish a request. This helper never launches or wakes an agent.
+# Budget globals are read by lib.sh; these checks intentionally fail if either test fails.
+# shellcheck disable=SC2034,SC2015
+# shellcheck disable=SC1091
+source "$(cd "$(dirname "$0")" && pwd -P)/lib.sh"
+HD_ERROR_CODE=invalid_arguments
+HD_ERROR_MESSAGE='Invalid arguments'
+HD_RESULT='{}'
+HD_OUTCOME=not-submitted
+hd_error() { HD_ERROR_CODE=$1; HD_ERROR_MESSAGE=$2; return "$3"; }
+
+new_run_main() {
+    local cwd='' body='' role='' timeout='' seen_cwd=0 seen_body=0 seen_role=0 seen_timeout=0 options=1 arg
+    local resolved requester rc entry name id stage final at metadata lock_token result published
+    hd_deadline_start 30000 || return $?
+    for arg in "$@"; do
+        if [ "$arg" = --help ]; then
+            if [ "$#" -ne 1 ]; then return 2; fi
+            printf 'Usage: bin/new-run --cwd ABS_DIR --body-file FILE [--role STRING] [--timeout-ms N]\n'
+            return 0
+        fi
+    done
+    while [ "$#" -gt 0 ]; do
+        arg=$1; shift
+        if [ "$options" -eq 1 ]; then
+            case "$arg" in
+                --) options=0; continue ;;
+                --cwd|--body-file|--role|--timeout-ms)
+                    [ "$#" -gt 0 ] || return 2
+                    case "$arg" in
+                        --cwd) [ "$seen_cwd" -eq 0 ] || return 2; cwd=$1; seen_cwd=1 ;;
+                        --body-file) [ "$seen_body" -eq 0 ] || return 2; body=$1; seen_body=1 ;;
+                        --role) [ "$seen_role" -eq 0 ] || return 2; role=$1; seen_role=1 ;;
+                        --timeout-ms) [ "$seen_timeout" -eq 0 ] || return 2; timeout=$1; seen_timeout=1 ;;
+                    esac
+                    shift; continue ;;
+            esac
+        fi
+        return 2
+    done
+    [ "$seen_cwd" -eq 1 ] && [ "$seen_body" -eq 1 ] || return 2
+    [ "$seen_role" -eq 0 ] || [ -n "$role" ] || return 2
+    if [ "$seen_timeout" -eq 1 ]; then
+        # Validate without resetting the entry deadline.
+        rc=$HD_STARTED_SECONDS
+        hd_deadline_start "$timeout" || return 2
+        HD_STARTED_SECONDS=$rc
+    fi
+    hd_config_load || { rc=$?; hd_error invalid_config 'Cannot load a valid config' "$rc"; return "$rc"; }
+    if [ "$seen_timeout" -eq 0 ]; then HD_BUDGET_MS=$(printf '%s\n' "$HD_CONFIG_JSON" | jq -r .ring_timeout_ms); fi
+    case "$cwd" in /*) ;; *) return 2 ;; esac
+    case "/$cwd/" in */../*|*/./*) return 2 ;; esac
+    resolved=$(hd_directory "$cwd") || { hd_error invalid_cwd 'Cwd must be an existing directory' 2; return 2; }
+    cwd=$resolved
+    [ -f "$body" ] && [ ! -L "$body" ] || { hd_error invalid_body 'Body must be a regular file' 2; return 2; }
+    hd_private_init || return $?
+    # Snapshot the body before validation so later caller edits cannot change the publication.
+    cp -- "$body" "$HD_PRIVATE/body.md" || { hd_error io_error 'Cannot read the body file' 6; return 6; }
+    iconv -f UTF-8 -t UTF-8 "$HD_PRIVATE/body.md" >/dev/null 2>&1 || { hd_error invalid_body 'Body must be UTF-8' 2; return 2; }
+    jq -Rse '
+        contains("\u0000") | not' "$HD_PRIVATE/body.md" >/dev/null || { hd_error invalid_body 'Body contains NUL' 2; return 2; }
+    jq -Rse '
+        split("\n") as $lines |
+        all(["## Task","## Expected output"][];
+            . as $heading | [$lines | to_entries[] | select(.value == $heading) | .key] as $hits |
+            ($hits | length == 1) and
+            ($lines[($hits[0]+1):] | (map(test("^## ")) | index(true)) as $end |
+                .[:$end] | join("\n") | test("\\S")))' "$HD_PRIVATE/body.md" >/dev/null || { hd_error invalid_body 'Task and Expected output sections must be nonempty' 2; return 2; }
+    [ "${HERDR_ENV:-}" = 1 ] && [ -n "${HERDR_PANE_ID:-}" ] || { hd_error requester_context 'Requester context is required' 3; return 3; }
+    requester=$(hd_current_identity) || {
+        rc=$?
+        if [ "$rc" -eq 4 ]; then hd_error budget_expired 'Requester query budget expired' 4
+        else
+            hd_error identity_unavailable 'Cannot verify requester identity' "$rc"
+            if [ "$rc" -eq 6 ] && [ -s "$HD_PRIVATE/external-code.json" ]; then
+                HD_ERROR_CODE=$(jq -r . "$HD_PRIVATE/external-code.json")
+            fi
+        fi
+        return "$rc"
+    }
+    # Runtime creates private run infrastructure only, never config or global paths.
+    for entry in "$HD_RUN_ROOT" "$HD_RUN_ROOT/.staging" "$HD_RUN_ROOT/.locks"; do
+        hd_no_links "$entry" || { hd_error unsafe_path 'Run paths must not use symlinks' 2; return 2; }
+        if [ ! -e "$entry" ]; then
+            mkdir -- "$entry" 2>/dev/null || [ -d "$entry" ] || { hd_error io_error 'Cannot create run infrastructure' 6; return 6; }
+        fi
+        hd_no_links "$entry" && [ -d "$entry" ] || { hd_error unsafe_path 'Invalid run directory' 2; return 2; }
+    done
+    # Records and unresolved launches are ownership evidence. Names alone never grant ownership.
+    for entry in "$HD_RUN_ROOT/.workers" "$HD_RUN_ROOT/.launches"; do
+        hd_no_links "$entry" || { hd_error unsafe_path 'Unsafe managed record path' 2; return 2; }
+        [ ! -e "$entry" ] || [ -d "$entry" ] || { hd_error malformed_record 'Managed record directory is invalid' 3; return 3; }
+    done
+    shopt -s nullglob dotglob
+    for entry in "$HD_RUN_ROOT/.dispatcher.json" "$HD_RUN_ROOT/.workers/"* "$HD_RUN_ROOT/.launches/"*; do
+        [ -e "$entry" ] || [ -L "$entry" ] || continue
+        case "$entry" in
+            "$HD_RUN_ROOT/.dispatcher.json") name=dispatcher ;;
+            "$HD_RUN_ROOT/.workers/"*) name=worker ;;
+            *) name=launch ;;
+        esac
+        hd_safe_file "$entry" && hd_json_validate "$name" "$entry" || { hd_error malformed_record 'Cannot verify managed requester exclusion' 3; return 3; }
+        if jq -e --argjson requester "$requester" '.pane_id == $requester.pane_id or (.identity != null and (.identity.pane_id == $requester.pane_id or .identity.terminal_id == $requester.terminal_id))' "$entry" >/dev/null; then
+            hd_error managed_requester 'Managed participants cannot request delegation' 3
+            return 3
+        fi
+    done
+    shopt -u nullglob dotglob
+    while :; do
+        hd_remaining_ms >/dev/null || { hd_error budget_expired 'Publication budget expired' 4; return 4; }
+        id="$(date -u '+%Y%m%dT%H%M%SZ')-$(hd_random 8)"
+        stage="$HD_RUN_ROOT/.staging/$id"
+        final="$HD_RUN_ROOT/$id"
+        hd_no_links "$stage" && hd_no_links "$final" || { hd_error unsafe_path 'Unsafe publication path' 2; return 2; }
+        [ ! -e "$final" ] || continue
+        if ! mkdir -- "$stage" 2>/dev/null; then
+            [ -d "$stage" ] && continue
+            hd_error io_error 'Cannot reserve a staging directory' 6; return 6
+        fi
+        at=$(hd_now)
+        metadata=$(jq -cn --arg id "$id" --argjson requester "$requester" --arg cwd "$cwd" --arg at "$at" --arg role "$role" --argjson has_role "$seen_role" '{schema_version:1,run_id:$id,from_pane:$requester.pane_id,requester:$requester,cwd:$cwd,created_at:$at} + (if $has_role == 1 then {role:$role} else {} end)') || return 6
+        { printf '%s\n%s\n%s\n' '---' "$metadata" '---'; cat -- "$HD_PRIVATE/body.md"; } > "$stage/request.md" || { hd_error io_error 'Cannot write request' 6; return 6; }
+        jq -n --arg id "$id" --arg at "$at" '
+            {schema_version:1,run_id:$id,revision:0,state:"new",created_at:$at,updated_at:$at,
+             assignment:null,worker_release:{phase:"none",observed_at:null,reason:null},
+             delivery:{phase:"none",attempt_id:null,started_at:null,acknowledged_at:null,error:null},
+             nudge:{phase:"none",attempt_id:null,started_at:null,acknowledged_at:null,settled_observed_at:null,error:null},
+             notice:{type:null,phase:"none",attempts:0,last_attempt_at:null,attempt_id:null,in_flight:false,last_outcome:null,error:null},
+             error:null,human:{attention:false,missing_requester:false,late_result:false}}' > "$stage/status" || { hd_error io_error 'Cannot write initial status' 6; return 6; }
+        hd_json_validate request "$stage/request.md" && hd_json_validate status "$stage/status" || { hd_error invalid_document 'Generated request or status is invalid' 2; return 2; }
+        hd_lock_acquire "$HD_RUN_ROOT/.locks/state" || { rc=$?; hd_error lock_unavailable 'Cannot take publication lock' "$rc"; return "$rc"; }
+        lock_token=$HD_LOCK_TOKEN
+        hd_no_links "$stage" && hd_no_links "$final" || { hd_error unsafe_path 'Publication paths changed' 2; return 2; }
+        if [ -e "$final" ]; then
+            hd_lock_release "$HD_RUN_ROOT/.locks/state" "$lock_token" || return $?
+            continue
+        fi
+        hd_remaining_ms >/dev/null || { hd_error budget_expired 'Publication budget expired' 4; return 4; }
+        result=$(jq -cn --arg id "$id" --arg path "$final" --argjson requester "$requester" '{run_id:$id,run_path:$path,request_path:($path+"/request.md"),status_path:($path+"/status"),requester:$requester}') || return 6
+        rc=0
+        mv -- "$stage" "$final" || rc=$?
+        if [ "$rc" -ne 0 ] || ! hd_lock_release "$HD_RUN_ROOT/.locks/state" "$lock_token"; then
+            published=false
+            if [ -d "$final" ] && hd_json_validate request "$final/request.md" && hd_json_validate status "$final/status"; then published=true; fi
+            HD_RESULT=$(printf '%s\n' "$result" | jq -c --argjson published "$published" '. + {published:$published}')
+            HD_OUTCOME=uncertain
+            hd_error publication_uncertain 'Inspect the saved run before submitting again' 5
+            return 5
+        fi
+        HD_RESULT=$result
+        HD_OUTCOME=ok
+        return 0
+    done
+}
+status=0
+new_run_main "$@" || status=$?
+if [ "$#" -eq 1 ] && [ "$1" = --help ] && [ "$status" -eq 0 ]; then exit 0; fi
+if [ "$status" -eq 0 ]; then
+    hd_emit "$HD_OUTCOME" "$HD_RESULT" null
+else
+    error=$(jq -cn --arg code "$HD_ERROR_CODE" --arg message "$HD_ERROR_MESSAGE" --argjson retryable false '{code:$code,message:$message,retryable:$retryable}')
+    hd_emit "$HD_OUTCOME" "$HD_RESULT" "$error"
+fi
+exit "$status"
