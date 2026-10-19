@@ -1,13 +1,16 @@
 # Offline shell tests
 
-Run `bash tests/run.sh` for all tests. Pass test names or groups (`runner`,
-`shell`, `fake`, `state`, `ring`, `spawn`, `blockers`, `client_contract`) to select tests. Unknown or empty selections exit 2. A failed
+Run `bash "tests/run.sh"` for all tests. Pass test names or groups (`runner`,
+`shell`, `fake`, `state`, `ring`, `spawn`, `blockers`, `client_contract`, `setup`, `whole_flow`) to select tests. Unknown or empty selections exit 2. A failed
 case exits 1. The deliberate failure is available only to the inner runner
 self-test, never to the default suite.
 
 Run `bash tests/lint.sh` for Bash syntax and ShellCheck on all shipped shell
 files, including the hook and the fake CLI. Bash 3.2, jq, and standard system
-utilities run the tests. ShellCheck is an additional lint dependency.
+utilities run the runtime tests. Setup tests also need Python3 for the setup-only standard-library
+file writer. Python is not a runtime dependency. ShellCheck is an additional lint dependency.
+Do not install packages or run `pi --version` to validate this documentation; the latter can
+mutate installation cleanup.
 
 Each case gets a private temporary root, HOME, config, run directory, and
 PATH-selected fake CLI. The runner removes only its marked temporary root on
@@ -116,6 +119,13 @@ records. Run `bash tests/run.sh blockers` for historical workspace ownership,
 registration crash gaps, and dispatcher input in a worker-created workspace.
 These groups use the real helpers with the fake CLI only.
 
+The model cases `spawn_claude_worker_model`, `spawn_claude_dispatcher_model`,
+`spawn_claude_default_model`, `spawn_pi_model_isolation`, and `spawn_invalid_claude_model`
+check exact Claude launch arguments, unchanged defaults/Pi startup, and invalid config rejection
+before any CLI call. `setup_claude_model_preserved` and `setup_invalid_claude_model` check the
+same optional config field through setup. Invalid cases include trailing newlines and oversized
+values. Fake launch arguments do not prove which model a live Claude session uses.
+
 Queued mutations can update persistent agent/workspace inventories through
 `after_agent_list` and `after_workspace_list`. Repeated queued commands are
 consumed in order. Persistent reads still require a unique match.
@@ -134,3 +144,92 @@ bodies under `fixtures/reports/` cover both roles. Tests generate matching
 frontmatter from sandbox records and validate reports through the real helper.
 They do not prove skill discovery, model routing, or repeated-notice handling.
 Those checks need separate approved live pi/Claude sessions.
+
+## Whole-flow simulations
+
+Run `bash tests/run.sh whole_flow` for Task 4.2. Select an exact case name for a
+shorter check. `tests/flow.sh` composes real publication, registry, assignment,
+CAS, ring, worker synchronization, reuse, and retirement calls. Each scenario
+uses private fake CLI state. Calls have finite budgets. The shell-heavy group
+can take several minutes; running many cases in parallel can exhaust query budgets.
+
+The 25 cases are:
+
+- `review_round_trip`
+- `explore_round_trip`
+- `restart_after_send`
+- `lost_bell_then_reconcile`
+- `role_queue_preserved`
+- `result_before_worker_idle`
+- `busy_requester_relay_deferred`
+- `replaced_requester_not_prompted`
+- `nudge_only_once`
+- `completed_result_survives_worker_exit`
+- `ttl_cleanup_only_owned_idle`
+- `relayed_worker_released_on_later_turn`
+- `gone_requester_does_not_hold_capacity`
+- `failed_worker_retired_only_when_settled`
+- `unknown_worker_not_reassigned`
+- `failed_notice_retry_fair`
+- `failed_late_result_preserved`
+- `nudge_timeout_not_resent`
+- `uncertain_nudge_blocks_retry_and_failure`
+- `missing_report_failure_relayed_to_saved_requester`
+- `blocked_assigned_worker_quarantined`
+- `malformed_run_inventory_blocks_assignment`
+- `worker_launch_ownership_mismatch_blocks_assignment_and_reuse`
+- `held_worker_cannot_be_claimed_by_second_run`
+- `direct_cas_cannot_mutate_assignment_snapshot`
+
+Both role round trips publish a real request, reuse a fixture-owned worker,
+assign it, observe fake working activity after ring, save sent delivery, publish
+an atomic report, send DONE, mark done/pending, relay RESULT, and release/reuse
+only after a later settled observation. Initial ownership and live topology are
+synthetic fixtures, not a live startup check. Reports use saved assignment tokens.
+The temporary report is scanned before rename and must not count as completion.
+
+The test code explicitly makes the dispatcher decisions. Restart cases stop at
+durable boundaries; they do not kill a dispatcher or execute a model algorithm.
+An unresolved `sending` attempt rejects a fresh attempt token, but this does not
+prove that a model will choose not to ring it again. Lost bells are omitted, then
+a fresh scan discovers the report. The fair retry case sorts saved notices and
+rings them in that order. These checks do not prove agent routing, model
+deduplication, report quality, or requester handling. Further cases require a
+later settled observation before `missing_report`, relay FAILED to the saved
+requester, reject retry/failure after uncertain nudges, and check blocked,
+malformed, stale-ownership, duplicate-assignment, and immutable-assignment paths.
+Final guards compare retained request/report bytes and reject non-read-only CLI
+calls in quarantine cases. They reject prompts to unrelated panes or closes
+outside checked retirement. No offline test grants setup or live-operation
+approval.
+
+## Setup contracts and limits
+
+Run `bash "tests/run.sh" setup` for Task 4.1 and `bash "tests/lint.sh"` for shell checks.
+The setup group calls the real preview/apply helper with sandbox config, HOME, fake herdr,
+and synthetic installed-agent metadata. It does not write real skill links or trust stores.
+It does not grant user setup or live-operation approval.
+
+Cases cover write-free preview, idempotent apply, config selection/replacement, link conflicts,
+invalid JSON, preserved unrelated trust keys and denied children, explicit trust selection,
+Claude's stopped-writer gate, private generated files, unsupported overrides, missing reporters,
+protected root ancestors, supported Herdr 0.9.5, and rejected mixed, unknown, or wrong-protocol
+Herdr versions. Further cases cover backup/source changes, destination directory and symlink swaps,
+parent replacement, native lock replacement, expired transaction checks,
+and retained evidence for signals before and after commit.
+
+The managed Pi fixtures represent filesystem metadata for Pi 1.2.0 and 1.3.0 with
+proper-lockfile 4.1.2, a 10000-ms stale interval, and a 5000-ms update interval. Tests reject
+other Pi versions. The setup-only Python writer holds an empty
+native lock plus a private sibling sidecar. It checks a 2000-ms cap with monotonic and wall clocks,
+parent-chain and inode identity, and source snapshots. It never steals or heartbeats the lock.
+Parent-fd atomic replacement cannot be redirected into a newly substituted parent directory.
+Uncertain evidence remains for inspection. Tests do not prove a hard real-time bound, power-loss
+durability, or immunity to malicious external writers. Claude's declaration and final source
+comparison cannot prevent an unsynchronized external write after that check. Real Claude config
+writers must be stopped by the user before separately approved trust apply.
+
+Fake metadata and controlled file-change cases do not prove compatibility with a future installed
+agent version, live native locking under all scheduling conditions, skill discovery, or model
+handling. Do not trust all Documents or Documents/test for these checks. Fixture trust and live
+panes require separate explicit approval; offline tests are not that approval.

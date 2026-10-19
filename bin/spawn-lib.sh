@@ -257,7 +257,12 @@ sp_launch() {
     sp_start
 }
 sp_start() {
-    local rc=0 next pane remaining code identity metadata
+    local rc=0 next pane remaining code identity metadata model
+    local model_args=()
+    if [ "$SP_KIND" = claude ]; then
+        model=$(printf '%s\n' "$HD_CONFIG_JSON" | jq -r '.claude_model // empty') || return 6
+        if [ -n "$model" ]; then model_args=(-- --model "$model"); fi
+    fi
     pane=$(printf '%s\n' "$SP_LAUNCH" | jq -r .pane_id)
     while :; do
         remaining=$(hd_remaining_ms) || { sp_problem uncertain budget_expired 5; return $?; }
@@ -268,7 +273,7 @@ sp_start() {
             return 5
         fi
         rc=0
-        hd_child_call write -- herdr agent start "$(printf '%s\n' "$SP_NAME" | jq -r .)" --kind "$SP_KIND" --pane "$pane" --timeout "$remaining" || rc=$?
+        hd_child_call write -- herdr agent start "$(printf '%s\n' "$SP_NAME" | jq -r .)" --kind "$SP_KIND" --pane "$pane" --timeout "$remaining" "${model_args[@]}" || rc=$?
         if [ "$rc" -eq 0 ]; then
             # Creation is fixture-backed; startup acknowledgement is not. Require a
             # structured response and independent readiness, never a text success.

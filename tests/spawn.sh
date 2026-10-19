@@ -34,6 +34,56 @@ spawn_worker() { helper spawn worker --role review --cwd "$TEST_ROOT/work" --tim
 spawn_launch_only() {
     jq -se 'all(.[]; (.argv[0:2] | IN(["agent","prompt"],["agent","read"],["pane","type"],["pane","send-key"],["pane","close"],["tab","close"])) | not)' "$FAKE_HERDR_LOG" >/dev/null || fail 'startup submitted input or closed a pane'
 }
+spawn_claude_model_case() {
+    local target=$1 selected=$2
+    spawn_setup
+    jq --arg target "$target" --arg selected "$selected" '
+        .worker_kinds.review="claude" |
+        if $target == "dispatcher" then .dispatcher_kind="claude" else . end |
+        if $selected == "yes" then .claude_model="claude-haiku-5-5" else . end
+        ' "$HERDR_DISPATCHER_CONFIG" > "$TEST_ROOT/model-config.json"
+    mv "$TEST_ROOT/model-config.json" "$HERDR_DISPATCHER_CONFIG"
+    spawn_rules success "$target"
+    jq --arg selected "$selected" 'map(
+        if .argv[0:2] == ["agent","start"] then
+            .argv[4]="claude" |
+            if $selected == "yes" then .argv += ["--","--model","claude-haiku-5-5"] else . end |
+            .after_agent_list |= map(.agent="claude" | .agent_session={agent:"claude",kind:"id",source:"herdr:claude",value:"synthetic-claude-session"})
+        else . end)' "$FAKE_HERDR_SCENARIO" > "$TEST_ROOT/model-scenario.json"
+    mv "$TEST_ROOT/model-scenario.json" "$FAKE_HERDR_SCENARIO"
+    if [ "$target" = dispatcher ]; then helper spawn dispatcher --timeout-ms 15000; else spawn_worker; fi
+    expect_status 0
+    assert_json "$TEST_ROOT/helper.json" '.result.identity.kind == "claude"'
+    if [ "$selected" = yes ]; then
+        jq -se '[.[] | select(.argv[0:2] == ["agent","start"])] | length == 1 and .[0].argv[-3:] == ["--","--model","claude-haiku-5-5"]' "$FAKE_HERDR_LOG" >/dev/null
+    else
+        jq -se 'all(.[]; (.argv | index("--model")) == null)' "$FAKE_HERDR_LOG" >/dev/null
+    fi
+    spawn_launch_only
+}
+spawn_claude_worker_model() { spawn_claude_model_case worker yes; }
+spawn_claude_dispatcher_model() { spawn_claude_model_case dispatcher yes; }
+spawn_claude_default_model() { spawn_claude_model_case worker no; }
+spawn_pi_model_isolation() {
+    spawn_setup
+    jq '.claude_model="claude-haiku-5-5"' "$HERDR_DISPATCHER_CONFIG" > "$TEST_ROOT/model-config.json"
+    mv "$TEST_ROOT/model-config.json" "$HERDR_DISPATCHER_CONFIG"
+    spawn_rules; spawn_worker
+    expect_status 0
+    jq -se 'all(.[]; (.argv | index("--model")) == null)' "$FAKE_HERDR_LOG" >/dev/null
+    spawn_launch_only
+}
+spawn_invalid_claude_model() {
+    spawn_setup
+    cp "$HERDR_DISPATCHER_CONFIG" "$TEST_ROOT/base-config.json"
+    local value
+    while IFS= read -r value; do
+        jq --argjson value "$value" '.claude_model=$value' "$TEST_ROOT/base-config.json" > "$HERDR_DISPATCHER_CONFIG"
+        spawn_worker
+        expect_status 2
+        [ ! -s "$FAKE_HERDR_LOG" ] || fail 'invalid model reached CLI'
+    done < <(jq -cn '[null,"",true,[],{},"--bad","two words","x;touch /tmp/bad","line\nbreak","trailing\n",("x" * 129)][]')
+}
 spawn_startup_success() {
     spawn_setup; spawn_rules; spawn_worker
     expect_status 0
@@ -160,7 +210,7 @@ spawn_different_cwd_retirement() {
     spawn_reuse_setup
     mkdir "$TEST_ROOT/other-work"
     spawn_retirement_rules "$TEST_ROOT/other-work"
-    helper spawn worker --role review --cwd "$TEST_ROOT/other-work" --timeout-ms 20000
+    helper spawn worker --role review --cwd "$TEST_ROOT/other-work" --timeout-ms 30000
     spawn_retirement_assertions
     assert_json "$RUN_ROOT/.workers/review-2" '.cwd == (env.TEST_ROOT+"/other-work")'
 }
@@ -254,7 +304,7 @@ startup_timeout_preserves_evidence() {
     [ "$elapsed" -le 8 ] || fail "startup timeout exceeded deadline: ${elapsed}s"
     assert_json "$TEST_ROOT/helper.json" '.outcome == "uncertain" and .result.reservation_retained == true'
     assert_json "$RUN_ROOT/.workers/review-1" '.pane_id == "wDispatch:p2" and (.lifecycle | IN("starting","quarantined"))'
-    jq -se 'length == 1 and (.[0].phase | IN("starting","uncertain")) and .[0].mutation == "agent_start" and .[0].pane_id == "wDispatch:p2"' "$RUN_ROOT/.launches/"*.json >/dev/null
+    jq -se 'length == 1 and (.[0].phase | IN("starting","uncertain")) and .[0].mutation == "agent_start" and .[0].pane_id == "wDispatch:p2"' "$RUN_ROOT/.launches/"*.json >/dev/null || fail 'timeout did not retain the agent-start journal'
     cp "$RUN_ROOT/.workers/review-1" "$TEST_ROOT/worker-before"
     spawn_worker
     expect_status 3

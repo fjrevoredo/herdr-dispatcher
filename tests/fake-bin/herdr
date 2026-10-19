@@ -25,7 +25,20 @@ inside_file() {
 }
 inside_directory "$PWD"
 inside_directory "${HOME:-/}"
-inside_file "${HERDR_DISPATCHER_CONFIG:-/}"
+# Setup inspects these two read-only endpoints before it creates the config.
+# All runtime calls still require an existing, regular sandbox config.
+case "$*" in
+    status|'integration status')
+        if [ -e "${HERDR_DISPATCHER_CONFIG:-/}" ] || [ -L "${HERDR_DISPATCHER_CONFIG:-/}" ]; then
+            inside_file "${HERDR_DISPATCHER_CONFIG:-/}"
+        else
+            case "${HERDR_DISPATCHER_CONFIG:-}" in "$root"/*) ;; *) refuse 'config outside test root' ;; esac
+            parent=$(dirname "$HERDR_DISPATCHER_CONFIG")
+            while [ ! -e "$parent" ] && [ ! -L "$parent" ]; do parent=$(dirname "$parent"); done
+            inside_directory "$parent"
+        fi ;;
+    *) inside_file "${HERDR_DISPATCHER_CONFIG:-/}" ;;
+esac
 inside_file "${FAKE_HERDR_LOG:-/}"
 inside_file "${FAKE_HERDR_SCENARIO:-/}"
 
@@ -84,7 +97,7 @@ entry=$(jq -ce --argjson argv "$argv" '
     ' "$FAKE_HERDR_SCENARIO") || refuse 'unexpected command or invalid scenario'
 if [ "$(printf '%s\n' "$entry" | jq -r '.persistent // false')" = true ]; then
     case "${1:-} ${2:-}" in
-        'agent list'|'agent get'|'agent read'|'pane current'|'pane process-info'|'workspace list'|'tab list') ;;
+        'status '|'integration status'|'agent list'|'agent get'|'agent read'|'pane current'|'pane process-info'|'workspace list'|'tab list') ;;
         *) refuse 'persistent mutation rule' ;;
     esac
 else

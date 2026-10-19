@@ -15,6 +15,10 @@ source "$TEST_REPO/tests/spawn.sh"
 source "$TEST_REPO/tests/blockers.sh"
 # shellcheck disable=SC1091
 source "$TEST_REPO/tests/client.sh"
+# shellcheck disable=SC1091
+source "$TEST_REPO/tests/setup.sh"
+# shellcheck disable=SC1091
+source "$TEST_REPO/tests/flow.sh"
 
 runner_self_test() {
     local status=0
@@ -39,7 +43,7 @@ no_test_selector_rejected() {
 
 shell_files() {
     local file
-    for file in tests/run.sh tests/lint.sh tests/helpers.sh tests/state.sh tests/spawn.sh tests/client.sh tests/fake-bin/herdr tests/fixtures/collision-date tests/fixtures/collision-od .githooks/pre-commit; do
+    for file in tests/run.sh tests/lint.sh tests/helpers.sh tests/flow.sh tests/state.sh tests/spawn.sh tests/client.sh tests/setup.sh tests/fake-bin/herdr tests/fixtures/collision-date tests/fixtures/collision-od .githooks/pre-commit; do
         [ -x "$TEST_REPO/$file" ] || fail "not executable: $file"
         /bin/bash -n "$TEST_REPO/$file"
     done
@@ -168,13 +172,17 @@ state_names=(gone_worker_sync_recovers_crash_gaps gone_worker_sync_closes_journa
 for name in "${state_names[@]}"; do names+=("$name"); groups+=(state); done
 ring_names=(ring_success_literal busy_target_not_prompted concurrent_ringers_serialized alias_lock_shared blocked_target_not_typed total_deadline_bounded signal_releases_own_lock live_lock_not_stolen dead_lock_recovered ambiguous_delivery_not_resent replaced_target_under_lock_not_prompted self_target_rejected hung_query_deadline_bounded ring_ownership_required ring_expected_required released_dead_owner_retried worker_record_disappears_while_waiting requester_result_input_accepted registered_dispatcher_reconcile ring_common_options working_ack_identity_required)
 for name in "${ring_names[@]}"; do names+=("$name"); groups+=(ring); done
-spawn_names=(spawn_startup_success spawn_dispatcher_success busy_shell_retry_bounded spawn_busy_deadline trust_dialog_not_answered create_response_lost_not_repeated config_override_propagated unregistered_dispatcher_refused same_cwd_reuse worker_capacity_reserved different_cwd_replaced expired_worker_replaced wrong_named_agent_refused concurrent_dispatcher_start startup_timeout_preserves_evidence startup_lock_deadline_bounded unrelated_pane_never_closed ready_journal_missing_registration_recovered ambiguous_created_recovery_refuses_start fresh_worker_retirement_refused ambiguous_idle_retirement_refused public_retirement_eligibility replaced_occupant_retirement_refused explicit_dispatcher_registration_reused)
+spawn_names=(spawn_claude_worker_model spawn_claude_dispatcher_model spawn_claude_default_model spawn_pi_model_isolation spawn_invalid_claude_model spawn_startup_success spawn_dispatcher_success busy_shell_retry_bounded spawn_busy_deadline trust_dialog_not_answered create_response_lost_not_repeated config_override_propagated unregistered_dispatcher_refused same_cwd_reuse worker_capacity_reserved different_cwd_replaced expired_worker_replaced wrong_named_agent_refused concurrent_dispatcher_start startup_timeout_preserves_evidence startup_lock_deadline_bounded unrelated_pane_never_closed ready_journal_missing_registration_recovered ambiguous_created_recovery_refuses_start fresh_worker_retirement_refused ambiguous_idle_retirement_refused public_retirement_eligibility replaced_occupant_retirement_refused explicit_dispatcher_registration_reused)
 for name in "${spawn_names[@]}"; do names+=("$name"); groups+=(spawn); done
 blocker_names=(closed_worker_workspace_replacement retired_worker_historical_launch_required nonterminal_worker_workspace_proof_required registration_journal_gap_uncertain registration_journal_gap_observed registration_journal_gap_mismatch_refused ring_worker_created_workspace_dispatcher)
 for name in "${blocker_names[@]}"; do names+=("$name"); groups+=(blockers); done
 client_names=(missing_context missing_config moved_caller_resolved managed_requester_rejected foreign_result_path_rejected failure_path_validated preserved_run_after_ring_timeout client_role_fixtures)
 for name in "${client_names[@]}"; do names+=("$name"); groups+=(client_contract); done
-group_names=(runner shell fake state ring spawn blockers client_contract)
+setup_names=(herdr_093_legacy_status_supported herdr_095_pair_supported herdr_mixed_pair_refused herdr_unknown_version_refused herdr_wrong_protocol_refused pi_13_trust_adapter_supported pi_unknown_trust_adapter_refused setup_claude_model_preserved setup_invalid_claude_model mkdir_child_uncertain_recorded ln_child_uncertain_recorded python_preflight_rejected backup_disk_full backup_partial_write backup_signal backup_fsync_failure mkdir_signal_recorded ln_signal_recorded mkdir_uncertain_recorded ln_uncertain_recorded preview_has_no_writes apply_is_idempotent config_override_resolved conflicting_link_refused invalid_trust_json_preserved unrelated_trust_keys_preserved concurrent_trust_edit_refused native_pi_lock_respected denied_child_trust_preserved claude_writer_gate_required trust_requires_explicit_apply generated_files_private unsupported_agent_dir_refused missing_reporter_reported backup_edit_keeps_validated_baseline directory_swap_before_rename symlink_swap_before_rename parent_swap_before_rename deadline_overrun_inside_inspection native_lock_replacement_inside_inspection native_lock_replacement_before_rename deadline_overrun_at_final_destination_stat signal_retains_uncommitted_evidence signal_retains_committed_evidence protected_root_ancestor_refused role_kind_default_requires_reporter)
+for name in "${setup_names[@]}"; do names+=("$name"); groups+=(setup); done
+flow_names=(review_round_trip explore_round_trip restart_after_send lost_bell_then_reconcile role_queue_preserved result_before_worker_idle busy_requester_relay_deferred replaced_requester_not_prompted nudge_only_once completed_result_survives_worker_exit ttl_cleanup_only_owned_idle relayed_worker_released_on_later_turn gone_requester_does_not_hold_capacity failed_worker_retired_only_when_settled unknown_worker_not_reassigned failed_notice_retry_fair failed_late_result_preserved nudge_timeout_not_resent uncertain_nudge_blocks_retry_and_failure missing_report_failure_relayed_to_saved_requester blocked_assigned_worker_quarantined malformed_run_inventory_blocks_assignment worker_launch_ownership_mismatch_blocks_assignment_and_reuse held_worker_cannot_be_claimed_by_second_run direct_cas_cannot_mutate_assignment_snapshot)
+for name in "${flow_names[@]}"; do names+=("$name"); groups+=(whole_flow); done
+group_names=(runner shell fake state ring spawn blockers client_contract setup whole_flow)
 if [ "${TEST_RUNNER_INNER:-0}" = 1 ]; then group_names+=(--inner-empty); fi
 selectors=("$@")
 if [ "$#" -eq 0 ]; then selectors=(all); fi

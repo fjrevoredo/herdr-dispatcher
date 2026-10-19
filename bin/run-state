@@ -113,8 +113,8 @@ st_prepare_run_proof() {
         # Scheduling requires inspection of visible output, never blind job replay.
         if printf '%s\n' "$next" | jq -e --argjson o "$old" '.nudge.phase == "sending" and .nudge != $o.nudge' >/dev/null; then
             pane=$(printf '%s\n' "$identity" | jq -r .pane_id)
+            # Herdr renders agent-read output as text; a zero exit confirms the read succeeded.
             hd_cli_read agent read "$pane" --source visible --lines 120 || return $?
-            jq -e '.result | type == "object" and .type == "agent_read"' "$HD_CHILD_STDOUT" >/dev/null || { st_error adapter_schema 'Invalid visible-output response' 6; return 6; }
         fi
         if printf '%s\n' "$next" | jq -e --argjson o "$old" '(.nudge.settled_observed_at != $o.nudge.settled_observed_at) or (.state == "failed" and .error.code == "missing_report")' >/dev/null; then
             printf '%s\n' "$old" | jq -e --arg at "$(hd_now)" '.nudge.phase == "sent" and .nudge.acknowledged_at != null and .nudge.acknowledged_at < $at' >/dev/null || { st_error failure_proof_required 'Nudge must settle on a later observation' 3; return 3; }

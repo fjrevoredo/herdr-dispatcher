@@ -1,8 +1,9 @@
 # Herdr Dispatcher V1 protocol
 
 This document defines the product contract. The helpers and agent instructions must follow it.
-It does not claim that those helpers already exist. V1 uses Bash 3.2, jq, and the local herdr CLI.
-There is no database, watcher, YAML parser, or application build.
+V1 runtime uses Bash 3.2, jq, and the local herdr CLI. Explicit user-approved setup also
+requires Python3 for the standard-library-only internal file writer `lib/setup-files.py`.
+Python is not a runtime dependency. There is no database, watcher, YAML parser, or application build.
 
 ## 1. Scope and safety
 
@@ -31,7 +32,8 @@ and occupant arguments use the exact field sets below without an extra version f
 other versions, unknown fields, missing required fields, wrong types, and invalid enum values. The examples define complete field sets;
 nullable fields must be present as `null` unless explicitly described as optional. JSON values
 must not contain NUL. Parse with jq and serialize generated documents with jq; do not add a
-second JSON parser. Schema validation applies to jq's parsed object (its last value wins for a
+second JSON parser in runtime. The setup-only Python writer parses its private stdin document
+and compares file snapshots; setup schema validation remains in jq. Schema validation applies to jq's parsed object (its last value wins for a
 repeated key). Do not parse JSON with shell splitting, execute it, source it, or use `eval`.
 
 - IDs: `YYYYMMDDTHHMMSSZ-` plus 16 lowercase hex digits from 8 bytes of OS randomness. Example:
@@ -118,6 +120,19 @@ No secrets, shell code, models, or credentials belong here. Default kinds are pi
 900 seconds; both default budgets are 30000 ms. Setup expands the selected default roots under
 `$HOME/Documents/smec-dev` and `$HOME/Documents/private` and displays their physical paths.
 
+Config also permits optional `claude_model`, for example `"claude_model":"claude-haiku-5-5"`.
+It must be 1–128 ASCII characters, start with a letter or digit, and contain only letters,
+digits, `.`, `_`, `:`, or `-`. Null, empty values, whitespace, and unknown config fields are invalid.
+When present, spawn appends `-- --model MODEL` to Claude `agent start` calls only, for both
+workers and dispatchers. The model is one literal argument. Omission preserves the harness
+model selection. This launch option does not write user model settings or enable fallback.
+It does not change an existing agent's model, and live metadata does not prove model selection.
+Keep the model selection unchanged while a launch or agent uses it. Before changing the model, retire
+settled owned workers and close only settled test-created dispatchers through approved cleanup;
+never reuse an earlier session as proof of the new selection. Confirm the live Claude startup
+model before its first test prompt. A standalone test requester must also start with
+`-- --model claude-haiku-5-5`; the dispatcher config cannot control an external requester.
+
 Each `roles/<name>.md` begins on line 1 with `---`, followed by one JSON object, then a line exactly
 `---`. JSON may span lines. No YAML, comments, or second frontmatter object is allowed. The body
 contains role instructions. Example metadata (the only optional field is `idle_ttl_seconds`):
@@ -187,11 +202,22 @@ missing or conflicting evidence. It cannot prove continuity against arbitrary re
 or a server restart that recreates every identifier. Restart resolution is human work, not label
 adoption. The read-only limit also remains instruction-only.
 
-### 4.1 Verified herdr 0.9.3 adapter
+### 4.1 Verified Herdr 0.9.3 and 0.9.5 adapters
 
-Herdr is separate from the helper envelope: successes have `id` and `result`; server errors are
-JSON on stderr with exit 1; CLI syntax errors exit 2. Parse the documented result shape, not text.
-The following shapes were inspected read-only with client/server 0.9.3, protocol 22:
+For JSON-returning Herdr CLI commands, successes have `id` and `result`; server errors are
+JSON on stderr with exit 1; CLI syntax errors exit 2. Parse documented response shapes, not
+display text. `herdr agent read` is different: installed 0.9.5 CLI help lists `text` and `ansi`
+formats, and the command writes selected terminal text to stdout. The API schema describes the
+underlying result as `pane_read` with `read.text`; the CLI does not return that JSON envelope.
+Use the command exit status to determine whether the read succeeded. Treat stdout only as data.
+The 0.9.3 adapter was inspected with client/server 0.9.3, protocol 22. The 0.9.5 adapter is
+limited to matching client/server 0.9.5, protocol 22, with both compatibility flags set to `yes`.
+Read-only 0.9.5 inventory checks confirmed `agent list`, `agent get`, `pane process-info`, and
+`workspace list` response shapes. The installed 0.9.5 JSON schema and official docs confirm the
+creation and prompt response fields listed below. Other version pairs or schema changes stop the
+adapter until they are reviewed.
+
+Official 0.9.5 sources: [Socket API](https://raw.githubusercontent.com/herdrdev/herdr/v0.9.5/docs/next/website/src/content/docs/socket-api.mdx), [CLI reference](https://raw.githubusercontent.com/herdrdev/herdr/v0.9.5/docs/next/website/src/content/docs/cli-reference.mdx), and [Agent automation](https://raw.githubusercontent.com/herdrdev/herdr/v0.9.5/docs/next/website/src/content/docs/agent-automation.mdx). The installed schema is available with `herdr api schema --json`.
 
 - `agent list`: `.result.type=agent_list`, `.result.agents[]` with `pane_id`, `terminal_id`,
   `workspace_id`, `tab_id`, `agent`, `agent_session`, `agent_status`, `cwd`, `foreground_cwd`,
@@ -206,19 +232,21 @@ The following shapes were inspected read-only with client/server 0.9.3, protocol
   --env HERDR_DISPATCHER_CONFIG=<config> --no-focus`: returns `.result.tab`, `.result.root_pane`.
   Obtain `.workspace_id`, `.tab_id`, `.pane_id` from the corresponding returned objects.
 - `agent start <name> --kind <kind> --pane <id> --timeout <remaining-ms>` is launch-only;
-  re-query identity and readiness after its response. No positional task or native trust flags.
+  re-query identity and readiness after its response. Optional Claude model selection uses
+  `-- --model <config.claude_model>` (verified installed help). No task or native trust flags.
 - `agent prompt <pane> <message> --wait --until working --timeout <remaining-ms>` is the only
   application input primitive. `agent_prompted` alone is not handling proof. `timeout` or
   `agent_prompt_stalled` after submission is uncertain. Never use raw pane input as fallback.
-- `agent get <pane>` and `agent read <pane> --source visible --lines 120` inspect uncertainty.
-  For a settled agent, `--source recent-unwrapped` can supply evidence. Reads do not send input.
+- `agent get <pane>` inspects live metadata. `agent read <pane> --source visible --lines 120`
+  reads visible terminal text; for a settled agent, `--source recent-unwrapped` can supply evidence.
+  It prints text rather than a JSON envelope and does not send input.
 - `pane close <id>` and `tab close <id>` are cleanup mutations, not discovery.
   `notification show <title> --body <body> --sound none` alerts the human; never include task text.
 
-Creation help/skill documents the returned object locations; this task did not create anything to
-verify a live creation response. Offline fixtures and gated live checks must verify those shapes.
-Use workspace/tab inventories to check recorded topology before reuse. Any version/schema drift
-stops the adapter until it is reviewed. Do not update or restart herdr automatically.
+The 0.9.5 docs and installed schema confirm the returned object locations, but no live workspace,
+tab, agent, or prompt mutation was used to verify them. Live acceptance still needs separate user
+approval. Offline fixtures do not prove server behavior. Use workspace/tab inventories to check
+recorded topology before reuse. Do not update or restart Herdr automatically.
 
 ## 5. Requests, publication, and reports
 
@@ -782,7 +810,8 @@ Exactly one mode is required. Without config-input use a valid existing config, 
 with this checkout's physical repo path and the roots/kinds in §3. Config-input is the complete
 schema in §3, not executable settings. The destination is the active config path.
 `--replace-config` is an explicit user choice required to replace a conflicting repo/config; preview
-lists the exact difference. Default trust is none. Config/link apply does NOT imply trust apply.
+lists the exact difference. Without config-input, it changes only an existing config's repo_path
+to this physical checkout. With config-input, it permits the complete selected replacement. Default trust is none. Config/link apply does NOT imply trust apply.
 Only a user-run apply with non-none trust may change trust stores. Claude trust apply also requires
 `--claude-writers-stopped`, after the user actually stops writers; this flag is not an OS lock.
 Result is `{mode, config_path, config, checks, changes, conflicts, blocked_roots, backups}`.
@@ -792,35 +821,51 @@ backup_path}`. Dry run creates no directories, files, links, backups, panes, age
 Validation/conflicts fail without writes. Apply validates everything first; separate file writes
 are not a global transaction. On partial failure report applied changes/backups and stop.
 
-Check herdr/kind executables and current pi/Claude reporters; do not install or upgrade them.
+Check supported Herdr 0.9.3 or 0.9.5 client/server pairs, kind executables, and current pi/Claude reporters; do not install
+or upgrade them or any packages. Resolve pi's executable and managed installation metadata from
+the filesystem. Never run `pi --version`: even this command can mutate installation cleanup.
+Reject `PI_CODING_AGENT_DIR`, `PI_PACKAGE_DIR`, or `CLAUDE_CONFIG_DIR` overrides, including empty ones.
 Install `~/.agents/skills/ask-dispatcher -> <repo>/skills/ask-dispatcher`, then
-`~/.claude/skills/ask-dispatcher -> ~/.agents/skills/ask-dispatcher`. Pi 1.2.0 discovers the shared
+`~/.claude/skills/ask-dispatcher -> ~/.agents/skills/ask-dispatcher`. Pi 1.2.0 and 1.3.0 discover the shared
 location directly; do not add a duplicate pi link. Preserve matching links, refuse conflicting
 files/links. Unsupported agent-dir overrides, invalid JSON, and permission failures stop setup.
 
-Trust preview is separate and shows expanded roots and denied child decisions. Before trust apply,
-recheck installed pi documentation and `dist/core/trust-manager.js`. Pi 1.2.0 `trust.json` maps
-absolute paths to true/false/null; nearest saved decision wins. Preserve false children and all
-unrelated entries. Hold its native `trust.json.lock`, never steal it. This is an EMPTY mkdir lock, not §8 owner.json:
-adding a file would break proper-lockfile's rmdir. The inspected pi 1.2.0 adapter uses
-proper-lockfile's 10000-ms stale interval and 5000-ms update interval. Cap a setup trust
-transaction at 2000 ms from native lock creation through release; do no CLI/startup/ring work
-inside it. Precompute proposed JSON/backups before acquiring it, then re-read/compare before
-replacement. Do not use age-based reclaim or write a native lock heartbeat. Release only the
-empty directory whose creation and inode still match this attempt; compare its inode with
-`ls -di` (first numeric field) and retain any ambiguous lock for human resolution. A token-owned
-private sibling `<trust-path>.dispatcher-owner.<token>.json` uses the §8 owner schema and records
-this attempt without populating the native lock directory. It is mode 600; remove only your own
-sidecar after native lock release. A sidecar remnant does not authorize native lock reclamation.
-If OS suspension crosses the native stale interval, stop and report uncertain trust apply rather
-than assume continued ownership. This adapter is not a hard guarantee against concurrent writers
-during system suspension. Recheck native defaults before each implementation/version change. Recheck Claude's
-`projects.<path>.hasTrustDialogAccepted` schema before changing `~/.claude.json`. Require quiet
-Claude writers; comparison alone cannot prevent lost concurrent writes. Private backup first,
-preserve permissions/keys, compare source again before same-parent atomic replacement, stop if
-changed. Missing stores require verified expected parents. Never always-trust, remove denies,
-answer dialogs, pass automatic approval flags, or trust all of `~/Documents/test`. A smoke fixture
-needs separately approved specific trust. Runtime dispatcher/workers never run setup.
+Trust preview is separate and shows expanded roots and denied child decisions. Before pi trust
+apply, verify managed Pi 1.2.0 or 1.3.0 metadata and installed documentation, `dist/core/trust-manager.js`,
+and proper-lockfile 4.1.2 source. Unsupported versions stop, rather than guess. Pi `trust.json`
+maps absolute paths to true/false/null; nearest saved decision wins. Preserve false children and
+unrelated entries. A denied selected root is a conflict; denied children remain in blocked_roots.
+
+The native `trust.json.lock` is an EMPTY mkdir lock, not §8's owner.json directory. Adding a file
+would break native rmdir. Verified native stale/update intervals are 10000/5000 ms. The setup-only
+Python writer uses a 2000-ms cap from before mkdir through release, checked with both monotonic
+and wall clocks. Negative elapsed time or either expired clock stops with uncertainty. It does
+not use Bash SECONDS or ls for this transaction. No CLI/startup/ring work runs inside the lock.
+JSON bytes, backup, staging, and process identity are prepared before acquisition. No lock steal,
+age-based reclaim, or heartbeat is permitted. Device/inode, empty-directory, sidecar token, and
+physical parent-chain checks must agree before replacement and release. The mode-600 sibling
+`<trust-path>.dispatcher-owner.<token>.json` records this attempt with schema_version, pid,
+process_started_at, token, and created_at. Remove only that verified sidecar after native release.
+A remnant never authorizes reclaim. Signals, deadline expiry, or uncertain ownership retain
+locks and other evidence for human inspection; do not repeat or remove them automatically.
+
+The internal writer runs as `python3 -I` with JSON on stdin, using only the standard library.
+It makes private byte-exact backups, preserves existing destination permissions and unrelated
+keys, compares source snapshots, and checks destination type/inode immediately before replace.
+Atomic replacement uses the held parent directory file descriptor, not a newly resolved path.
+This prevents a directory rename from redirecting the write into a replacement directory.
+Parent and destination checks after replacement can still report an uncertain committed change.
+There is no global transaction, hard real-time guarantee, or immunity to malicious external
+writers. Suspension and blocking system calls can exceed a check interval; retain evidence.
+
+Recheck Claude's `projects.<path>.hasTrustDialogAccepted` schema against its installed executable
+without running its CLI. The user must stop all Claude config writers before apply and supply
+`--claude-writers-stopped`. This declaration is not a lock. Source comparison cannot prevent an
+external unsynchronized writer after the final check, for Claude or any unlocked destination.
+Missing stores require verified expected parents. Never always-trust, remove denies, answer
+dialogs, or pass automatic approval flags. Reject roots that contain HOME, all Documents, or the
+Documents/test tree. Do not trust all Documents or all Documents/test. A smoke fixture needs
+separately approved specific trust. Runtime dispatcher/workers never run setup.
 
 ### 12.7 `bin/lib.sh` internal API
 
@@ -858,11 +903,11 @@ body file; never substitute it into executable shell text.
 ```bash
 export HERDR_DISPATCHER_CONFIG="/absolute/config.json"
 repo=$(jq -er '.repo_path' "$HERDR_DISPATCHER_CONFIG")
-"$repo/bin/new-run" --cwd "/absolute/project" --role review --body-file "/absolute/request-body.md" > /private/new-run.json
-run_id=$(jq -er '.result.run_id' /private/new-run.json)
-"$repo/bin/spawn" dispatcher > /private/dispatcher.json
-expected=$(jq -ce '.result.identity' /private/dispatcher.json)
-"$repo/bin/ring" dispatcher "NEW $run_id" --expected-session "$expected"
+"$repo/bin/new-run" --cwd "/absolute/project" --role review --body-file "/absolute/request-body.md" > "/private/new-run.json"
+run_id=$(jq -er '.result.run_id' "/private/new-run.json")
+"$repo/bin/spawn" dispatcher > "/private/dispatcher.json"
+expected=$(jq -ce '.result.identity' "/private/dispatcher.json")
+"$repo/bin/ring" dispatcher "NEW $run_id" --expected-session "$expected" --timeout-ms 30000
 ```
 
 Check each exit code before the next step. `/private` above denotes an existing user-selected
@@ -872,11 +917,11 @@ run_id/run_path. Retry only the bell after validated startup/registration, not n
 Dispatcher assignment sequence (saved revision numbers come from a fresh registry):
 
 ```bash
-"$repo/bin/spawn" worker --role review --cwd "/absolute/project" > /private/worker.json
-"$repo/bin/run-state" assign "$run_id" --worker review-1 --expect-revision 0 --expect-worker-revision 0 > /private/assignment.json
-worker=$(jq -ce '.result.status.assignment.worker' /private/assignment.json)
-brief=$(< /private/work-brief.txt)
-"$repo/bin/ring" review-1 "$brief" --expected-session "$worker" > /private/send.json
+"$repo/bin/spawn" worker --role review --cwd "/absolute/project" > "/private/worker.json"
+"$repo/bin/run-state" assign "$run_id" --worker review-1 --expect-revision 0 --expect-worker-revision 0 > "/private/assignment.json"
+worker=$(jq -ce '.result.status.assignment.worker' "/private/assignment.json")
+brief=$(< "/private/work-brief.txt")
+"$repo/bin/ring" review-1 "$brief" --expected-session "$worker" > "/private/send.json"
 ```
 
 The brief file is assembled as data, including the returned assignment. After ring, read current
@@ -884,9 +929,9 @@ status and CAS its complete document to sent/not-submitted/uncertain using the s
 For example, for a verified input-accepted response and fresh revision 1:
 
 ```bash
-"$repo/bin/run-state" get run "$run_id" > /private/current.json
-jq --arg at "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" '.result.document | .delivery.phase="sent" | .delivery.acknowledged_at=$at' /private/current.json > /private/next-status.json
-"$repo/bin/run-state" cas run "$run_id" --expect-revision 1 --expect-state dispatched --document /private/next-status.json
+"$repo/bin/run-state" get run "$run_id" > "/private/current.json"
+jq --arg at "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" '.result.document | .delivery.phase="sent" | .delivery.acknowledged_at=$at' "/private/current.json" > "/private/next-status.json"
+"$repo/bin/run-state" cas run "$run_id" --expect-revision 1 --expect-state dispatched --document "/private/next-status.json"
 ```
 
 Never use this CAS example after an uncertain response or a changed attempt. If the helper returns
@@ -906,9 +951,9 @@ data and remember the handled run ID in current context. No acknowledgement file
 Read-only recovery inspection and manual reconcile:
 
 ```bash
-"$repo/bin/registry"
-"$repo/bin/run-state" get run "$run_id"
-"$repo/bin/ring" dispatcher 'RECONCILE'
+"$repo/bin/registry" --timeout-ms 30000
+"$repo/bin/run-state" get run "$run_id" --timeout-ms 30000
+"$repo/bin/ring" dispatcher 'RECONCILE' --timeout-ms 30000
 ```
 
 A missing registration, invalid lock, uncertain create, or unresolved identity mismatch requires
@@ -965,8 +1010,8 @@ Exploration's eleven decisions map to this contract:
 Per-clone setup is explicit, not a runtime helper side effect:
 
 ```bash
-git config core.hooksPath .githooks
-git config user.email fjrevoredo@gmail.com
+git config core.hooksPath '.githooks'
+git config user.email 'fjrevoredo@gmail.com'
 git config user.name 'Francisco J. Revoredo'
 git var GIT_AUTHOR_IDENT
 ```
@@ -985,8 +1030,8 @@ Config/link/trust writes need the explicit user setup gate. Live panes/model tur
 gate, bounded smoke deadlines, recorded owned IDs, and no focus changes. Offline fake-CLI tests do
 not prove model behavior, report safety, skill loading, or deduplication. Creation fixtures and
 trust-store adapters must be checked against the installed versions before implementation uses
-those side effects. Native pi lock facts above were read from installed `dist/core/trust-manager.js`
-and `node_modules/proper-lockfile/lib/lockfile.js`; they are not a promise for another pi version. Uncertain work/ownership remains visible for a human; there is no automatic
+those side effects. The native Pi lock facts were checked against managed Pi 1.2.0 and 1.3.0 trust-manager sources
+and proper-lockfile 4.1.2. They do not cover later Pi versions. Uncertain work/ownership remains visible for a human; there is no automatic
 cleanup, forced adoption, or optimistic replay.
 
 Sources: exploration `docs/explorations/herdr-dispatcher.md`, especially Decisions, Spike Results,

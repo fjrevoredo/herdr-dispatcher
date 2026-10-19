@@ -17,3 +17,17 @@ while IFS= read -r -d '' file; do
 done < <(find "$repo" -type d \( -name .git -o -name runs \) -prune -o -type f -print0)
 [ "$count" -gt 0 ] || { printf 'lint: no shell files found\n' >&2; exit 1; }
 printf 'PASS: syntax and ShellCheck (%s shell files)\n' "$count"
+# Parse maintained Python sources without importing them or producing bytecode.
+python3 -I -c '
+import sys
+sys.dont_write_bytecode = True
+import ast
+from pathlib import Path
+repo = Path(sys.argv[1])
+files = sorted(path for root in ("lib", "tests") for path in (repo / root).rglob("*.py"))
+if not files:
+    sys.exit("lint: no Python files found")
+for path in files:
+    ast.parse(path.read_bytes(), filename=str(path))
+print("PASS: Python AST syntax (%s files)" % len(files))
+' "$repo"

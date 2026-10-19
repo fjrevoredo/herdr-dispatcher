@@ -1,0 +1,124 @@
+#!/bin/bash
+# Explicit user setup only. Runtime helpers must never invoke this command.
+# Shared setup state is consumed by the sourced modules.
+# shellcheck disable=SC1091,SC2034
+umask 077
+SETUP_BIN=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P) || exit 6
+# shellcheck source=setup-lib.sh
+. "$SETUP_BIN/setup-lib.sh"
+# shellcheck source=setup-trust.sh
+. "$SETUP_BIN/setup-trust.sh"
+MODE=''; CONFIG_PATH=''; CONFIG=null; CHECKS='[]'; CHANGES='[]'
+CONFLICTS='[]'; BLOCKED='[]'; BACKUPS='[]'
+INPUT=''; REPLACE=false; TRUST=none; QUIET=false
+SEEN=' '; END=false
+trap setup_interrupt INT TERM
+command -v jq >/dev/null || { printf '%s\n' '{"schema_version":1,"ok":false,"outcome":"not-submitted","result":{},"error":{"code":"missing_jq","message":"jq is required","retryable":false}}'; exit 6; }
+command -v python3 >/dev/null || setup_fail 6 missing_python 'Python3 is required for setup only'
+setup_python_check
+SETUP_FILES_HELPER="${SETUP_BIN%/bin}/lib/setup-files.py"
+hd_safe_file "$SETUP_FILES_HELPER" && [ -r "$SETUP_FILES_HELPER" ] || setup_fail 6 missing_file_writer 'The internal setup file writer is missing or unsafe'
+while [ "$#" -gt 0 ]; do
+    option=$1; shift
+    if [ "$END" = true ]; then setup_fail 2 invalid_arguments 'Unexpected positional argument'; fi
+    case "$option" in
+        --help)
+            [ "$#" -eq 0 ] && [ "$SEEN" = ' ' ] || setup_fail 2 invalid_arguments 'Help must be used alone'
+            printf '%s\n' 'Usage: bin/setup --dry-run|--apply [--config-input FILE] [--replace-config] [--trust none|pi|claude|both] [--claude-writers-stopped]'
+            exit 0 ;;
+        --) END=true; continue ;;
+        --dry-run|--apply) key=mode ;;
+        --config-input|--replace-config|--trust|--claude-writers-stopped) key=$option ;;
+        *) setup_fail 2 invalid_arguments 'Unknown option or positional argument' ;;
+    esac
+    case "$SEEN" in *" $key "*) setup_fail 2 invalid_arguments 'Duplicate option' ;; esac
+    SEEN="$SEEN$key "
+    case "$option" in
+        --dry-run) MODE=dry-run ;;
+        --apply) MODE=apply ;;
+        --replace-config) REPLACE=true ;;
+        --claude-writers-stopped) QUIET=true ;;
+        --config-input) [ "$#" -gt 0 ] || setup_fail 2 invalid_arguments 'Missing config input'; INPUT=$1; shift ;;
+        --trust) [ "$#" -gt 0 ] || setup_fail 2 invalid_arguments 'Missing trust selection'; TRUST=$1; shift ;;
+    esac
+done
+[ -n "$MODE" ] || setup_fail 2 invalid_arguments 'Exactly one explicit mode is required'
+case "$TRUST" in none|pi|claude|both) ;; *) setup_fail 2 invalid_arguments 'Invalid trust selection' ;; esac
+# Reject even empty overrides: the adapter only supports the standard store locations.
+[ "${PI_CODING_AGENT_DIR+x}" != x ] && [ "${PI_PACKAGE_DIR+x}" != x ] && [ "${CLAUDE_CONFIG_DIR+x}" != x ] || setup_fail 2 unsupported_override 'Agent directory overrides are not supported'
+SETUP_HOME=$(hd_directory "$HOME") || setup_fail 2 invalid_home 'HOME must be an existing directory'
+CONFIG_PATH=$(setup_path "${HERDR_DISPATCHER_CONFIG:-$HOME/.config/herdr-dispatcher/config.json}") || setup_fail 2 invalid_config_path 'Config path must be a safe absolute path'
+setup_parent_check "$CONFIG_PATH" || setup_fail 6 unsafe_config_path 'Config destination or parent is unsafe or not writable'
+CONFIG_PRESENT=false; ORIGINAL_CONFIG=''
+if [ -e "$CONFIG_PATH" ]; then
+    CONFIG_PRESENT=true
+    ORIGINAL_CONFIG=$(jq -cse 'if length == 1 then .[0] else error("multiple values") end' "$CONFIG_PATH") || setup_fail 2 invalid_config 'Existing config is invalid JSON'
+fi
+if [ -n "$INPUT" ]; then
+    [ -f "$INPUT" ] && [ -r "$INPUT" ] || setup_fail 2 invalid_config_input 'Config input must be a readable regular file'
+    CONFIG=$(jq -cse 'if length == 1 then .[0] else error("multiple values") end' "$INPUT") || setup_fail 2 invalid_config 'Config input is invalid JSON'
+elif [ "$CONFIG_PRESENT" = true ]; then CONFIG=$ORIGINAL_CONFIG
+else
+    ROOT_WORK=$(hd_directory "$SETUP_HOME/Documents/smec-dev") || setup_fail 2 missing_default_root 'Default smec-dev root does not exist; supply complete config input'
+    ROOT_PRIVATE=$(hd_directory "$SETUP_HOME/Documents/private") || setup_fail 2 missing_default_root 'Default private root does not exist; supply complete config input'
+    CONFIG=$(jq -nc --arg repo "$(cd "$SETUP_BIN/.." && pwd -P)" --arg work "$ROOT_WORK" --arg private "$ROOT_PRIVATE" '{schema_version:1,repo_path:$repo,dispatcher_kind:"pi",worker_kinds:{review:"pi",explore:"pi"},idle_ttl_seconds:900,ring_timeout_ms:30000,startup_timeout_ms:30000,trust_roots:[$work,$private]}') || setup_fail 6 json_error 'Cannot prepare defaults'
+fi
+# --replace-config alone replaces an old checkout selection, not other settings.
+CHECKOUT=$(cd "$SETUP_BIN/.." && pwd -P)
+if [ -z "$INPUT" ] && [ "$CONFIG_PRESENT" = true ] && [ "$REPLACE" = true ]; then
+    CONFIG=$(printf '%s\n' "$CONFIG" | jq -c --arg repo "$CHECKOUT" '.repo_path=$repo') || setup_fail 2 invalid_config 'Cannot replace checkout selection'
+fi
+setup_config_validate
+if [ "$CONFIG_PRESENT" = true ] && [ "$(printf '%s\n' "$ORIGINAL_CONFIG" | jq -Sc .)" != "$(printf '%s\n' "$CONFIG" | jq -Sc .)" ]; then
+    setup_check config_difference "$(jq -nc --argjson before "$ORIGINAL_CONFIG" --argjson after "$CONFIG" '{before:$before,after:$after}')"
+    [ "$REPLACE" = true ] || setup_conflict "$CONFIG_PATH" 'Config differs; explicit --replace-config is required'
+    setup_change "$CONFIG_PATH" replace
+elif [ "$CONFIG_PRESENT" = false ]; then
+    setup_parent_plan "$(dirname "$CONFIG_PATH")" || setup_fail 6 parent_plan_failed 'Cannot plan private config parents'
+    setup_change "$CONFIG_PATH" create
+fi
+# A saved config pointing elsewhere is also a conflict, even without config-input.
+REPO=$(printf '%s\n' "$CONFIG" | jq -r .repo_path)
+if [ -z "$INPUT" ] && [ "$REPO" != "$CHECKOUT" ]; then
+    setup_conflict "$CONFIG_PATH" 'Configured repo differs from this checkout; use --replace-config or select a complete --config-input'
+fi
+setup_dependencies
+LINK_SHARED="$SETUP_HOME/.agents/skills/ask-dispatcher"
+LINK_CLAUDE="$SETUP_HOME/.claude/skills/ask-dispatcher"
+# A config override must not overlap a skill link or a native trust location.
+for RESERVED in "$LINK_SHARED" "$LINK_CLAUDE" "$SETUP_HOME/.pi/agent/trust.json" "$SETUP_HOME/.pi/agent/trust.json.lock" "$SETUP_HOME/.claude.json"; do
+    case "$CONFIG_PATH/" in "$RESERVED/"*) setup_conflict "$CONFIG_PATH" 'Config overlaps a reserved setup destination' ;; esac
+    case "$RESERVED/" in "$CONFIG_PATH/"*) setup_conflict "$CONFIG_PATH" 'Config overlaps a reserved setup destination' ;; esac
+done
+setup_link_plan "$LINK_SHARED" "$REPO/skills/ask-dispatcher"
+setup_link_plan "$LINK_CLAUDE" "$LINK_SHARED"
+case "$TRUST" in
+    pi|both) setup_pi_adapter; setup_trust_plan pi "$SETUP_HOME/.pi/agent/trust.json" ;;
+esac
+case "$TRUST" in
+    claude|both)
+        if [ "$MODE" = apply ] && [ "$QUIET" != true ]; then
+            setup_conflict "$SETUP_HOME/.claude.json" 'Claude trust apply requires --claude-writers-stopped after writers stop'
+        fi
+        setup_trust_plan claude "$SETUP_HOME/.claude.json" ;;
+esac
+[ "$(printf '%s\n' "$CONFLICTS" | jq length)" -eq 0 ] || setup_fail 3 setup_conflict 'Setup validation found conflicts; nothing was written'
+setup_check validation 'All selected changes validated; trust is separate from config and links'
+[ "$MODE" = apply ] || setup_emit 0
+# No global transaction is claimed. Each completed change is recorded before the next.
+CONFIG_ACTION=$(printf '%s\n' "$CHANGES" | jq -r --arg path "$CONFIG_PATH" 'any(.[]; .path == $path)')
+if [ "$CONFIG_ACTION" = true ]; then setup_write_file "$CONFIG_PATH" "$CONFIG" "$ORIGINAL_CONFIG" "$CONFIG_PRESENT" false; fi
+for LINK in "$LINK_SHARED" "$LINK_CLAUDE"; do
+    TARGET=$(printf '%s\n' "$CHANGES" | jq -r --arg path "$LINK" '.[] | select(.path == $path and .action == "symlink") | .target')
+    [ -n "$TARGET" ] || continue
+    setup_mkdir "$(dirname "$LINK")" || setup_fail 6 unsafe_parent 'Cannot create private link parents'
+    hd_no_links "$(dirname "$LINK")" && [ ! -e "$LINK" ] && [ ! -L "$LINK" ] || setup_fail 3 link_changed 'Link destination changed before apply'
+    # ln without -f never overwrites a conflict. -n also refuses a late symlink-to-directory.
+    setup_bash_mutation symlink "$LINK" "$TARGET"
+done
+for ((I=0; I<${#TRUST_PATHS[@]}; I++)); do
+    NATIVE=false
+    [ "${TRUST_PATHS[$I]}" != "$SETUP_HOME/.pi/agent/trust.json" ] || NATIVE=true
+    setup_write_file "${TRUST_PATHS[$I]}" "${TRUST_JSON[$I]}" "${TRUST_ORIGINALS[$I]}" "${TRUST_PRESENT[$I]}" "$NATIVE"
+done
+setup_emit 0
